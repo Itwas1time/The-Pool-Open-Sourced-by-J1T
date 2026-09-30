@@ -569,15 +569,32 @@ def prepare_to_write():
     wired = (wired_from_node() if node_running() else []) or find_wired()
 
 
+def split_entries(text):
+    entries, current = [], []
+    for line in text.splitlines(keepends=True):
+        if line.startswith("[") and current:
+            entries.append("".join(current))
+            current = []
+        current.append(line)
+    return entries + (["".join(current)] if current else [])
+
+
+def author(entry):
+    return entry.split("] ", 1)[-1].split("\n")[0].split(" -> ")[0].strip()
+
+
 def wait_new(who, timeout):
-    """The notification: block until someone writes something new, then return it."""
+    """The notification: block until someone else writes something new, then return it (your own
+    writes never wake you). In Claude Code, run it in the background: the session wakes when it exits."""
     end = time.time() + max(0.0, float(timeout))
+    me = addr(agent_name(who) or "anyone", NAME)
     if not (DATA / "read" / (agent_name(who) or "anyone")).exists():
         new_entries(who, first_time="skip")  # a first-time waiter starts at the end of the book
+    got = []
     while True:
-        text = new_entries(who)
-        if text or time.time() >= end:
-            return text
+        got += split_entries(new_entries(who))
+        if any(author(e) != me for e in got) or time.time() >= end:
+            return "".join(got) if any(author(e) != me for e in got) else ""
         time.sleep(2)
 
 
@@ -792,14 +809,7 @@ def push_to_session(who, respond):
             chunk = f.read(size - seen)
         chunk = chunk[:chunk.rfind(b"\n") + 1]
         seen += len(chunk)
-        entries, current = [], []
-        for line in chunk.decode("utf-8", "replace").splitlines(keepends=True):
-            if line.startswith("[") and current:
-                entries.append("".join(current))
-                current = []
-            current.append(line)
-        entries += ["".join(current)] if current else []
-        others = [e for e in entries if e.split("] ", 1)[-1].split(" -> ")[0].split("\n")[0].strip() != me]
+        others = [e for e in split_entries(chunk.decode("utf-8", "replace")) if author(e) != me]
         if others:
             respond({"jsonrpc": "2.0", "method": "notifications/claude/channel",
                      "params": {"content": "New in the Pool book:\n" + "".join(others).rstrip(),
