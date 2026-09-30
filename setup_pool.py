@@ -7,10 +7,16 @@ traffic. The Pool therefore runs as its own copy of the interpreter:
 The local project rules are never touched. Firewall rules are added for the two copies only:
   - inbound: the Pool's TCP and UDP ports, from the local subnet only
   - outbound: every public internet address blocked (the Pool stays on your own wire)
-Run it again after updating Python.
+It also adds "The Pool" shortcuts (desktop + Start menu, with the Pool's icon) and an
+on-demand scheduled task "ThePool" that `pool.bat start` uses to run the Pool with no
+window, outside whatever shell asked for it. The task has no trigger: never at logon.
+And it gives Claude Code and Codex on this machine the Pool as native tools (an MCP
+server named "pool", as agent "claude" and "codex"); Codex's config.toml is backed up first.
+Run it again after updating Python or moving this folder (paths are stored exactly).
 """
 import ctypes
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -61,6 +67,85 @@ def add_firewall_rules():
     print("Firewall rules added (local project's own rules were not changed).")
 
 
+def powershell(script):
+    result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                            capture_output=True, text=True)
+    if result.stdout.strip():
+        print(result.stdout.rstrip())
+    if result.returncode != 0:
+        raise SystemExit(f"Failed:\n{result.stderr}")
+
+
+def add_task_and_shortcuts():
+    exe, script, icon = RUNTIME / "thepool.exe", HERE / "pool.py", HERE / "assets" / "thepool.ico"
+    powershell(f"""
+$ErrorActionPreference = 'Stop'
+$action = New-ScheduledTaskAction -Execute '{exe}' -Argument '"{script}" serve' -WorkingDirectory '{HERE}'
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -Priority 7
+$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName 'ThePool' -Action $action -Settings $settings -Principal $principal -Force `
+    -Description 'The Pool with no window. Started on demand by pool.bat start; never at logon.' | Out-Null
+'  scheduled task ThePool (on demand only, no trigger)'
+$shell = New-Object -ComObject WScript.Shell
+foreach ($dir in @([Environment]::GetFolderPath('Desktop'), (Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs'))) {{
+    $path = Join-Path $dir 'The Pool.lnk'
+    $link = $shell.CreateShortcut($path)
+    $link.TargetPath = '{exe}'
+    $link.Arguments = '"{script}"'
+    $link.WorkingDirectory = '{HERE}'
+    $link.IconLocation = '{icon},0'
+    $link.Description = 'The Pool: wired messenger between your machines'
+    $link.Save()
+    '  shortcut ' + $path
+}}
+""")
+
+
+def connect_agents():
+    """The Pool as native tools: MCP server 'pool' for Claude Code (agent claude) and Codex (agent codex)."""
+    exe, script = RUNTIME / "thepool-cli.exe", HERE / "pool.py"
+    claude = shutil.which("claude")
+    if claude:
+        subprocess.run([claude, "mcp", "remove", "pool", "-s", "user"], capture_output=True, text=True)
+        r = subprocess.run([claude, "mcp", "add", "pool", "-s", "user", "-e", "POOL_AGENT=claude", "--",
+                            str(exe), str(script), "mcp"], capture_output=True, text=True)
+        print("  Claude Code: 'pool' tools added (new sessions see them)" if r.returncode == 0 else
+              f"  Claude Code: could not add the tools: {(r.stderr or r.stdout).strip()[:300]}")
+    else:
+        print("  Claude Code not found on PATH - skipped")
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    if not codex_home.exists():
+        print("  Codex not found (no .codex folder) - skipped")
+        return
+    cfg = codex_home / "config.toml"
+    text = cfg.read_text(encoding="utf-8") if cfg.exists() else ""
+    newline = "\r\n" if "\r\n" in text else "\n"
+    kept, skipping = [], False
+    for line in text.splitlines():
+        if line.strip().startswith("["):
+            skipping = line.strip() in ("[mcp_servers.pool]", "[mcp_servers.pool.env]")
+        if not skipping:
+            kept.append(line)
+    block = ["", "[mcp_servers.pool]", f"command = '{exe}'", f"args = ['{script}', 'mcp']",
+             "startup_timeout_sec = 30", "tool_timeout_sec = 130", "", "[mcp_servers.pool.env]",
+             'POOL_AGENT = "codex"']
+    if cfg.exists():
+        shutil.copy2(cfg, cfg.with_name("config.toml.before-pool"))
+    cfg.write_text(newline.join(kept).rstrip() + newline + newline.join(block) + newline, encoding="utf-8",
+                   newline="")
+    print(f"  Codex: 'pool' tools added to {cfg} (previous copy: config.toml.before-pool)")
+
+
+def stop_running_pool():
+    """The runtime files cannot be replaced while the Pool runs from them."""
+    cli = RUNTIME / "thepool-cli.exe"
+    if cli.exists():
+        result = subprocess.run([str(cli), str(HERE / "pool.py"), "stop"], capture_output=True, text=True)
+        return "stopped" in result.stdout
+    return False
+
+
 def self_check():
     code = "import socket, tkinter, sys; print('thepool-cli.exe runs Python', sys.version.split()[0])"
     result = subprocess.run([str(RUNTIME / "thepool-cli.exe"), "-c", code], capture_output=True, text=True)
@@ -72,17 +157,22 @@ def self_check():
 def main():
     if sys.platform != "win32":
         raise SystemExit("Only Windows needs this setup. On Linux run: python3 pool.py")
+    was_running = stop_running_pool()
     try:
         copy_runtime()
     except PermissionError:
         raise SystemExit("Could not copy: close The Pool window first, then run the setup again.")
     self_check()
-    if "--no-firewall" in sys.argv:
-        return
-    if not ctypes.windll.shell32.IsUserAnAdmin():
-        raise SystemExit("Firewall rules need admin: run SETUP_THE_POOL.bat (it asks for admin by itself).")
-    add_firewall_rules()
-    print("\nSetup done. Open The Pool with START_THE_POOL.bat")
+    add_task_and_shortcuts()
+    connect_agents()
+    if "--no-firewall" not in sys.argv:
+        if not ctypes.windll.shell32.IsUserAnAdmin():
+            raise SystemExit("Firewall rules need admin: run SETUP_THE_POOL.bat (it asks for admin by itself).")
+        add_firewall_rules()
+    if was_running:
+        subprocess.run([str(RUNTIME / "thepool-cli.exe"), str(HERE / "pool.py"), "start"])
+    print("\nSetup done. Open The Pool from its desktop or Start menu shortcut; agents use pool.bat or the "
+          "'pool' tools.")
 
 
 if __name__ == "__main__":
