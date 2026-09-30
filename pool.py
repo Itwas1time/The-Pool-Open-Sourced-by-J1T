@@ -1,34 +1,24 @@
-"""The Pool: messages, files and notifications between your machines and their agents, over wired Ethernet.
+"""The Pool: a shared book your machines write in and talk through, over wired Ethernet.
 
-Machines find each other by UDP broadcast on their wired Ethernet ports only
-(Wi-Fi, VPN and virtual adapters are never used) and send messages and files
-over TCP on that same wire. Code travels through git; the Pool carries the
-message that names the repo, branch and commit.
+Like Tom Riddle's diary: write in it on one machine and the words appear in the book
+on every other machine. Each machine keeps the whole conversation in one plain text
+file, pool_data/pool.txt, for about two months. People and agents (Claude, Codex)
+use it the same way.
 
-Addresses: AGENT@MACHINE (codex@device1, claude@device4; a unique prefix
-works: codex@minas), a bare MACHINE (whichever agent there reads first) or all.
+  pool.bat say "text" [--to codex@minas]   write in the book (every online machine gets it)
+  pool.bat read                            what is new since I last read
+  pool.bat wait [--timeout SECONDS]        block until someone writes, then show it
+  pool.bat book [N]                        the last N entries (default 20)
+  pool.bat sendfile PATH [--to NAME]       send a file (saved in pool_data/files/)
+  pool.bat peers                           machines in the pool
+  pool.bat start | stop | status | serve   the Pool itself (start = in the background, no window)
+  pool.bat mcp                             the same as tools for Claude Code and Codex
+  --as NAME (or set POOL_AGENT) says who is writing: claude, codex, ...  The window writes as operator.
 
-  pool.bat send TO "text" [--subject S] [--git [REPO]]   send a message (text '-' reads stdin)
-  pool.bat reply ID "text" [--git [REPO]]                answer a message in the same thread
-  pool.bat read                                          print and take my new messages
-  pool.bat wait [--timeout SECONDS]                      block until a message arrives, then read it
-  pool.bat thread ID                                     the whole conversation
-  pool.bat open                                          what I took but have not replied to yet
-  pool.bat sendfile TO PATH                              send a file
-  pool.bat peers                                         machines, their agents, their status
-  pool.bat start | stop | status | serve                 the Pool itself (start = background, no window)
-  pool.bat mcp                                           the same as tools for Claude Code and Codex (MCP)
-  Add --as NAME (or set POOL_AGENT) to say which agent you are: claude, codex, ...
-
-The "The Pool" shortcut opens the window. One Pool runs per machine; if a
-background Pool is running, the window opens as a viewer onto it.
-
-On Windows the Pool runs as runtime\\thepool.exe / thepool-cli.exe (made once by
-SETUP_THE_POOL.bat) so local project's firewall block on python.exe is never involved.
-On Linux: python3 pool.py [same arguments].
-
-Standard library only. It sleeps between events and runs at below-normal
-priority, so it never competes with a game or anything else doing real work.
+Wired Ethernet only: Wi-Fi, VPN and virtual adapters are never used. On Windows it runs
+as runtime\\thepool.exe / thepool-cli.exe (made once by SETUP_THE_POOL.bat) so local project's
+firewall block on python.exe is never involved. On Linux: python3 pool.py [same arguments].
+Standard library only; it sleeps between events and runs at below-normal priority.
 """
 import base64
 import ctypes
@@ -44,19 +34,20 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "pool_config.json"
 DATA = HERE / "pool_data"
+BOOK = DATA / "pool.txt"
 ASSETS = HERE / "assets"
-VERSION = "4"
-TASK = "ThePool"           # Windows scheduled task that runs the background Pool (made by setup)
+TASK = "ThePool"           # Windows scheduled task that runs the Pool with no window (made by setup)
 
 HOST = socket.gethostname().lower()
-NAME = HOST                # replaced in load_config() by POOL_NAME or the shared names map
+NAME = HOST                # replaced in load_config() by POOL_NAME or the shared names table
 AGENT = os.environ.get("POOL_AGENT", "")
+KEEP_DAYS = 60             # the book keeps about two months
 ANNOUNCE_EVERY = 30        # seconds between "I'm here" broadcasts
 ONLINE_WINDOW = 90         # a machine counts as online if heard from this recently
 MAX_MESSAGE = 20_000_000   # bytes on the wire, about 15 MB of file
@@ -68,9 +59,9 @@ UDP_PORT = 50506
 NAMES = {}                 # hostname -> fleet name, from pool_config.json (same file on every machine)
 wired = []                 # IPv4Interface list: this machine's connected wired Ethernet ports
 
-peers = {}                 # name -> {"ip", "port", "last_seen", "ram", "status", "agents"}
+peers = {}                 # name -> {"ip", "port", "last_seen", "ram", "status"}
 lock = threading.Lock()
-received_count = 0         # bumps on every stored message
+book_lock = threading.Lock()
 alive = threading.Event()  # set while this process is the machine's Pool
 sockets = []
 node_mode, started_at = "", ""
@@ -114,8 +105,8 @@ def unpack(data):
 # ---- small helpers ----
 
 def write_file(path, data):
-    """Temp file, flush to disk, rename: a watcher never sees half a file."""
-    tmp = DATA / (path.name + ".part")
+    """Temp file, flush to disk, rename: nobody ever sees half a file."""
+    tmp = DATA / f"{path.name}.{os.getpid()}-{threading.get_ident()}.part"
     with open(tmp, "wb") as f:
         f.write(data)
         f.flush()
@@ -140,14 +131,8 @@ def safe(text, limit=60):
     return keep.strip("._")[:limit] or "x"
 
 
-def clean_id(text):
-    return "".join(c for c in str(text or "") if c.isalnum())[:16]
-
-
 def agent_name(text):
-    """claude, codex, ...; '' means no particular agent."""
-    name = "".join(c for c in str(text or "").lower() if c.isalnum() or c in "-_").strip("-_")[:30]
-    return "" if name in ("any", "read") else name
+    return "".join(c for c in str(text or "").lower() if c.isalnum() or c in "-_").strip("-_")[:30]
 
 
 def canonical(name):
@@ -156,8 +141,8 @@ def canonical(name):
     return NAMES.get(name, name)
 
 
-def addr(agent, machine):
-    return f"{agent}@{machine}" if agent else machine
+def addr(who, machine):
+    return f"{who}@{machine}" if who else machine
 
 
 def ago_text(seconds):
@@ -210,40 +195,78 @@ def lower_priority():
         pass
 
 
-# ---- which agents use the Pool here (shared with the other machines in each hello) ----
+# ---- the book: one plain text file, an entry is "[time] who@machine -> to" then indented lines ----
 
-_active_marked = {}
+def write_in_book(stamp, who, machine, to, text):
+    head = f"[{stamp}] {addr(who, machine)}" + (f" -> {to}" if to else "")
+    body = "\n".join("  " + line for line in (str(text).splitlines() or [""]))
+    DATA.mkdir(parents=True, exist_ok=True)
+    with book_lock, open(BOOK, "a", encoding="utf-8") as f:
+        f.write(f"{head}\n{body}\n")  # one write per entry
 
 
-def mark_active(agent):
-    now = time.time()
-    if now - _active_marked.get(agent, 0) < 60:
-        return
-    _active_marked[agent] = now
-    path = DATA / "agents.json"
+def last_entries(n):
     try:
-        agents = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        agents = {}
-    agents[agent] = now
-    try:
-        write_file(path, json.dumps(agents, indent=2).encode())
+        with open(BOOK, "rb") as f:
+            f.seek(max(0, f.seek(0, 2) - 400_000))
+            lines = f.read().decode("utf-8", "replace").splitlines(keepends=True)
     except OSError:
-        pass
+        return ""
+    heads = [i for i, line in enumerate(lines) if line.startswith("[")]
+    return "".join(lines[heads[-n]:]) if len(heads) >= n else "".join(lines[heads[0]:]) if heads else ""
 
 
-def agent_ages():
-    """{agent: seconds since it last read or waited}, for agents active in the last day."""
+def new_entries(who, first_time="history"):
+    """What was written since this reader last read, and move its bookmark to the end.
+    A reader with no bookmark gets the last 20 entries ('history') or nothing ('skip')."""
+    mark = DATA / "read" / (agent_name(who) or "anyone")
     try:
-        agents = json.loads((DATA / "agents.json").read_text(encoding="utf-8"))
+        size = BOOK.stat().st_size
+    except OSError:
+        size = 0
+    try:
+        start = min(int(mark.read_text()), size)
     except (OSError, ValueError):
-        return {}
-    now = time.time()
-    return {a: int(now - float(t)) for a, t in agents.items() if now - float(t) < 86400}
+        start = None
+    if start is None:
+        text = last_entries(20) if first_time == "history" else ""
+        end = size
+    else:
+        with open(BOOK, "rb") as f:
+            f.seek(start)
+            data = f.read(size - start)
+        data = data[:data.rfind(b"\n") + 1]  # never stop half-way through an entry
+        text, end = data.decode("utf-8", "replace"), start + len(data)
+    mark.parent.mkdir(parents=True, exist_ok=True)
+    mark.write_text(str(end))
+    return text
 
 
-def agents_text(ages):
-    return ", ".join(f"{a} {ago_text(s)}" for a, s in sorted((ages or {}).items(), key=lambda x: x[1]))
+def prune_book():
+    """Keep about two months: drop entries older than KEEP_DAYS and move every bookmark back to match."""
+    cutoff = (datetime.now() - timedelta(days=KEEP_DAYS)).strftime("%Y-%m-%d")
+    with book_lock:
+        try:
+            data = BOOK.read_bytes()
+        except OSError:
+            return
+        cut = 0
+        for line in data.splitlines(keepends=True):
+            if line.startswith(b"[") and line[1:11].decode("ascii", "replace") >= cutoff:
+                break
+            cut += len(line)
+        if cut == 0:
+            return
+        try:
+            write_file(BOOK, data[cut:])
+        except OSError:
+            return  # someone had the book open; try again tomorrow
+    for mark in (DATA / "read").glob("*"):
+        try:
+            mark.write_text(str(max(0, int(mark.read_text()) - cut)))
+        except (OSError, ValueError):
+            pass
+    log(f"book pruned: {cut} bytes older than {cutoff} removed")
 
 
 # ---- who is out there (peers.json is the monitoring file other scripts read) ----
@@ -256,7 +279,7 @@ def load_peers():
     with lock:
         for name, info in saved.items():
             name = canonical(name)
-            entry = {k: info.get(k) for k in ("ip", "port", "last_seen", "ram", "status", "agents", "version")}
+            entry = {k: info.get(k) for k in ("ip", "port", "last_seen", "ram", "status")}
             old = peers.get(name)
             if old is None or (entry.get("last_seen") or 0) >= (old.get("last_seen") or 0):
                 peers[name] = entry
@@ -271,6 +294,19 @@ def save_peers():
             write_file(DATA / "peers.json", json.dumps(snapshot, indent=2).encode())
         except OSError:
             pass  # a reader had it open; the next save fixes it
+
+
+def peers_text():
+    now = time.time()
+    rows = []
+    with lock:
+        items = sorted(peers.items())
+    for name, info in items:
+        ago = now - (info.get("last_seen") or 0)
+        status = next(iter((info.get("status") or "").splitlines()), "")
+        rows.append(f"{name:16} {'online ' if ago < ONLINE_WINDOW else 'offline'}  {info.get('ip') or '?':16} "
+                    f"seen {ago_text(ago):>8}   ram {info.get('ram')}%" + (f"   {status}" if status else ""))
+    return "\n".join(rows) or "No other machine seen yet."
 
 
 def find_wired():
@@ -329,8 +365,7 @@ def wired_source_for(ip):
 
 def announce(only_to=None):
     """Broadcast "I'm here" out of every wired port (or answer one machine directly)."""
-    data = pack({"kind": "hello", "from": NAME, "port": TCP_PORT, "ram": ram_percent(), "status": my_status(),
-                 "agents": agent_ages(), "version": VERSION})
+    data = pack({"kind": "hello", "from": NAME, "port": TCP_PORT, "ram": ram_percent(), "status": my_status()})
     if only_to:
         sends = [(wired_source_for(only_to), only_to)]
     else:
@@ -348,9 +383,13 @@ def announce(only_to=None):
 
 
 def announce_loop():
+    pruned_on = None
     while alive.is_set():
         announce()
         save_peers()
+        if pruned_on != datetime.now().date():
+            pruned_on = datetime.now().date()
+            prune_book()
         time.sleep(ANNOUNCE_EVERY)
 
 
@@ -371,91 +410,61 @@ def listen_udp(sock):
         name = canonical(msg["from"])
         if name == NAME:
             continue
-        ages = msg.get("agents") if isinstance(msg.get("agents"), dict) else {}
         try:
             port = int(msg.get("port") or TCP_PORT)
-            agents = {agent_name(a): int(s) for a, s in ages.items() if agent_name(a)}
         except (TypeError, ValueError):
             continue
         with lock:
             old = peers.get(name)
             is_new = old is None or old.get("ip") != ip or not is_online(old)
             peers[name] = {"ip": ip, "port": port, "last_seen": time.time(), "ram": msg.get("ram"),
-                           "status": str(msg.get("status") or "")[:STATUS_LIMIT], "agents": agents,
-                           "version": str(msg.get("version") or "")[:10]}
+                           "status": str(msg.get("status") or "")[:STATUS_LIMIT]}
         save_peers()
         if is_new:
             log(f"{name} is online at {ip}")
             announce(only_to=ip)  # so it learns about us now instead of in 30 s
 
 
-# ---- receiving: inbox/ keeps everything, queues/<agent>/ says who it is for ----
+# ---- receiving: everything goes into the book ----
 
-def header(meta):
-    lines = [f"From: {addr(meta.get('from_agent'), meta.get('from'))}",
-             f"To: {addr(meta.get('to_agent'), meta.get('to'))}",
-             f"Id: {meta.get('id')}", f"Thread: {meta.get('thread')}"]
-    if meta.get("reply_to"):
-        lines.append(f"Reply-To-Id: {meta['reply_to']}")
-    lines.append(f"Sent: {meta.get('sent') or '?'}")
-    if meta.get("subject"):
-        lines.append(f"Subject: {meta['subject']}")
-    if meta.get("git"):
-        lines.append("Git: " + "  ".join(f"{k}={v}" for k, v in meta["git"].items()))
-    if meta.get("kind") == "file":
-        lines.append(f"File: {meta.get('path')}")
-    return "\n".join(lines)
+def receive(msg):
+    """Write a received message (or file) into this machine's book."""
+    machine = safe(canonical(msg.get("from", "unknown")), 40)
+    who = agent_name(msg.get("who") or msg.get("from_agent"))  # from_agent: sent by a v4 Pool
+    to = str(msg.get("to") or msg.get("to_agent") or "")[:80]
+    stamp = str(msg.get("sent_at") or "").replace("T", " ")[:19] or f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+    text = str(msg.get("text") or "")
+    if msg.get("kind") == "file":
+        folder = DATA / "files"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{datetime.now():%Y%m%d-%H%M%S}_{machine}_{safe(msg.get('name', 'file'))}"
+        write_file(path, base64.b64decode(msg.get("data", "")))
+        text = f"(file) {msg.get('name', 'file')}  saved at {path}" + (f"\n{text}" if text else "")
+    write_in_book(stamp, who, machine, to, text)
+    if machine != NAME:
+        notify_here(f"New in the Pool book from {addr(who, machine)}" + (f" to {to}" if to else "") +
+                    f":\n{text[:1500]}\n(Read the book with the pool read tool or: pool read)")
 
 
-def store(msg):
-    """Save a received message or file into inbox/, queue it for its agent, add a NEW.txt line."""
-    global received_count
-    sender = safe(canonical(msg.get("from", "unknown")), 40)
-    is_file = msg.get("kind") == "file"
-    mid = clean_id(msg.get("id")) or secrets.token_hex(4)
-    git = msg.get("git")
-    meta = {"id": mid, "thread": clean_id(msg.get("thread")) or mid, "reply_to": clean_id(msg.get("reply_to")),
-            "from": sender, "from_agent": agent_name(msg.get("from_agent")),
-            "to": NAME, "to_agent": agent_name(msg.get("to_agent")),
-            "kind": "file" if is_file else "message", "subject": str(msg.get("subject") or "")[:200],
-            "sent": str(msg.get("sent_at") or "")[:30], "received": datetime.now().isoformat(timespec="seconds"),
-            "git": {str(k)[:20]: str(v)[:300] for k, v in git.items()} if isinstance(git, dict) else None}
-    if is_file:
-        data, label = base64.b64decode(msg.get("data", "")), safe(msg.get("name", "file"))
-    else:
-        data, label = None, f"{mid}.md"
-    with lock:
-        if msg.get("id"):  # a sender retrying after a timeout must not create a second copy
-            for earlier in (DATA / "queues").glob(f"*/*_{mid}.json"):
-                log(f"duplicate {mid} from {sender} ignored (already stored)")
-                try:
-                    return json.loads(earlier.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    return meta
-        (DATA / "inbox").mkdir(parents=True, exist_ok=True)
-        while True:
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-            path = DATA / "inbox" / f"{stamp}_from-{sender}_{label}"
-            if not path.exists():
-                break
-            time.sleep(0.002)
-        meta["path"] = str(path)
-        if data is None:
-            data = (header(meta) + "\n\n" + str(msg.get("text", ""))).encode("utf-8")
-        write_file(path, data)
-        queue = DATA / "queues" / (meta["to_agent"] or "any")
-        queue.mkdir(parents=True, exist_ok=True)
-        write_file(queue / f"{stamp}_{mid}.json", json.dumps(meta, indent=2).encode())
-        for attempt in range(5):
-            try:
-                with open(DATA / "NEW.txt", "a", encoding="utf-8") as f:
-                    f.write(f"{stamp}\t{sender}\t{meta['kind']}\t{path}\n")
-                break
-            except PermissionError:
-                time.sleep(0.1)
-        received_count += 1
-    log(f"got {meta['kind']} {mid} from {addr(meta['from_agent'], sender)} for {meta['to_agent'] or 'any agent'}")
-    return meta
+def notify_here(message):
+    """The notification, no watcher needed: run this machine's own notify command from
+    pool_data/notify.json, e.g. {"command": ["codex", "queue", "--thread", "<id>", "--message", "{message}"]}
+    to wake a Codex session. The words only ever go in as text; nothing received is executed."""
+    try:
+        command = json.loads((DATA / "notify.json").read_text(encoding="utf-8"))["command"]
+        args = [str(a).replace("{message}", message) for a in command]
+    except (OSError, ValueError, KeyError, TypeError):
+        return
+
+    def run():
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=120,
+                               creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            if r.returncode:
+                log(f"notify command failed: {(r.stderr or r.stdout).strip()[:200]}")
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"notify command failed: {e}")
+    threading.Thread(target=run, daemon=True).start()
 
 
 def handle(conn, ip):
@@ -471,7 +480,7 @@ def handle(conn, ip):
                 log(f"rejected a message from {ip} (wrong pool key or too big)")
                 conn.sendall(b"ERR rejected: wrong pool key or too big\n")
                 return
-            store(msg)
+            receive(msg)
             conn.sendall(b"OK\n")
         except Exception as e:
             log(f"error receiving from {ip}: {e}")
@@ -493,277 +502,83 @@ def serve_tcp(server):
         threading.Thread(target=handle, args=(conn, ip), daemon=True).start()
 
 
-# ---- sending ----
+# ---- writing: into my book and every online machine's book ----
 
-def resolve_machine(machine):
-    """Fleet name for a machine; a unique prefix works (minas -> device1)."""
+def mention(to):
+    """Tidy a --to mention: 'codex@minas' -> 'codex@device1'."""
+    who, _, machine = str(to or "").strip().lower().rpartition("@")
+    if not machine:
+        return ""
     machine = canonical(machine)
-    if machine in ("all", NAME):
-        return machine
     with lock:
-        known = list(peers)
-    if machine in known:
-        return machine
-    matches = [n for n in known + [NAME] if n.startswith(machine)]
-    return matches[0] if len(matches) == 1 else machine
+        known = list(peers) + [NAME]
+    matches = [n for n in known if n.startswith(machine)]
+    machine = machine if machine in known or len(matches) != 1 else matches[0]
+    return addr(agent_name(who), machine)
 
 
-def split_address(to):
-    """'codex@minas' -> ('codex', 'device1'); 'minas' -> ('', 'device1')."""
-    agent, _, machine = str(to).strip().lower().rpartition("@")
-    return agent_name(agent), resolve_machine(machine)
+def deliver(name, info, data):
+    source = wired_source_for(info["ip"])
+    if not source:
+        return name, False, "not reachable on a wired port"
+    try:
+        with socket.create_connection((info["ip"], info["port"]), timeout=5,
+                                      source_address=(source, 0)) as s, s.makefile("rb") as f:
+            s.settimeout(60)
+            s.sendall(data)
+            reply = f.readline(300).decode("utf-8", "replace").strip()
+        return name, reply == "OK", reply or "no reply"
+    except OSError as e:
+        if getattr(e, "winerror", None) == 10013:
+            return name, False, "blocked by the firewall - use pool.bat or the shortcut, not python.exe"
+        return name, False, str(e)
 
 
-def send(target, body):
-    """Send one message to a machine (or 'all' online ones). Returns [(machine, ok, detail)]."""
-    body = dict(body, **{"from": NAME, "sent_at": datetime.now().isoformat(timespec="seconds")})
+def say(text, to="", who="", path=None):
+    """Write in the book here and on every online machine. Returns [(machine, ok, detail)]."""
+    body = {"kind": "file" if path else "chat", "from": NAME, "who": agent_name(who), "to": mention(to),
+            "text": text, "sent_at": datetime.now().isoformat(timespec="seconds")}
+    if path:
+        body.update(name=Path(path).name, data=base64.b64encode(Path(path).read_bytes()).decode())
     data = pack(body)
     if len(data) > MAX_MESSAGE:
-        return [(target, False, "too big (limit is about 15 MB)")]
-    if target == NAME:
-        store(body)  # an agent on this same machine: no network needed
-        return [(NAME, True, "OK")]
+        return [("", False, "too big (limit is about 15 MB)")]
+    receive(dict(body))  # my own copy of the book
     with lock:
-        if target == "all":
-            chosen = [(n, dict(i)) for n, i in sorted(peers.items()) if is_online(i)]
-        else:
-            chosen = [(target, dict(peers[target]))] if target in peers else []
-    if not chosen:
-        return [(target, False, "no machines online" if target == "all" else "unknown machine (not seen yet)")]
-    results = []
-    for name, info in chosen:
-        source = wired_source_for(info["ip"])
-        if not source:
-            results.append((name, False, "not reachable on a wired port"))
-            continue
-        try:
-            with socket.create_connection((info["ip"], info["port"]), timeout=5,
-                                          source_address=(source, 0)) as s, s.makefile("rb") as f:
-                s.settimeout(60)
-                s.sendall(data)
-                reply = f.readline(300).decode("utf-8", "replace").strip()
-            results.append((name, reply == "OK", reply or "no reply"))
-        except OSError as e:
-            if getattr(e, "winerror", None) == 10013:
-                results.append((name, False, "blocked by the firewall - use pool.bat or START_THE_POOL.bat, "
-                                             "not python.exe"))
-            else:
-                results.append((name, False, str(e)))
+        targets = [(n, dict(i)) for n, i in sorted(peers.items()) if is_online(i)]
+    results = [deliver(name, info, data) for name, info in targets]
     for name, ok, detail in results:
-        log(f"sent {body.get('kind')} {body.get('id', '')} to {name}: {'OK' if ok else detail}")
+        if not ok:
+            log(f"could not deliver to {name}: {detail}")
     return results
 
 
-def file_body(path):
-    path = Path(path)
-    return {"kind": "file", "name": path.name, "data": base64.b64encode(path.read_bytes()).decode()}
+def said_text(results):
+    if not results:
+        return "Written in this machine's book; no other machine is online."
+    if results[0][0] == "":
+        return f"Not written: {results[0][2]}"
+    return "Written. " + "   ".join(f"{n}: {'delivered' if ok else 'NOT delivered - ' + d}" for n, ok, d in results)
 
 
-def git_info(repo):
-    """Repo, branch and commit to put on a message, so the receiver fetches exactly that code."""
-    def git(*args):
-        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=60)
-        return r.stdout.strip() if r.returncode == 0 else ""
-    commit = git("rev-parse", "HEAD")
-    if not commit:
-        raise ValueError(f"{repo} is not a git repository")
-    info = {"repo": git("config", "--get", "remote.origin.url") or str(Path(repo).resolve()),
-            "branch": git("rev-parse", "--abbrev-ref", "HEAD"), "commit": commit,
-            "worktree": f"{NAME}:{git('rev-parse', '--show-toplevel')}"}
-    if git("status", "--porcelain", "--untracked-files=no"):
-        info["uncommitted"] = "yes"
-    if not git("branch", "-r", "--contains", commit):
-        info["pushed"] = "no"
-    return info
+def prepare_to_write():
+    """A command-line or MCP writer borrows the running Pool's view of the wire and the machines."""
+    global wired
+    DATA.mkdir(parents=True, exist_ok=True)
+    load_peers()
+    wired = (wired_from_node() if node_running() else []) or find_wired()
 
 
-def git_warnings(git):
-    notes = []
-    if git and git.get("pushed") == "no":
-        notes.append("warning: that commit is not pushed, so the other machine cannot fetch it")
-    if git and git.get("uncommitted") == "yes":
-        notes.append("warning: the repo has uncommitted changes that are not in that commit")
-    return notes
-
-
-def record_sent(body, to, results):
-    rec = {k: v for k, v in body.items() if k != "data"}
-    rec.update(to=to, sent=datetime.now().isoformat(timespec="seconds"),
-               results=[[n, ok, d] for n, ok, d in results])
-    try:
-        (DATA / "sent").mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
-        write_file(DATA / "sent" / f"{stamp}_{body['id']}.json", json.dumps(rec, indent=2).encode())
-    except OSError:
-        pass
-
-
-def send_message(to, text="", subject="", reply_to="", thread="", agent="", git=None, path=None):
-    """Send a message (or a file, with path) to AGENT@MACHINE, MACHINE or all. Returns (id, results)."""
-    to_agent, machine = split_address(to)
-    mid = secrets.token_hex(4)
-    body = {"kind": "message", "id": mid, "thread": thread or mid, "reply_to": reply_to,
-            "from_agent": agent_name(agent), "to_agent": to_agent, "subject": subject, "text": text}
-    if git:
-        body["git"] = git
-    if path:
-        body.update(file_body(path))
-    results = send(machine, body)
-    record_sent(body, addr(to_agent, machine), results)
-    return mid, results
-
-
-def sent_report(mid, results, git=None):
-    lines = [f"id {mid}: " + "   ".join(f"{n} {'delivered' if ok else 'FAILED - ' + d}" for n, ok, d in results)]
-    return "\n".join(lines + git_warnings(git))
-
-
-# ---- reading: each message is taken once, by one agent ----
-
-def take(agent):
-    """Claim and return this agent's new messages: its own queue, then anything for 'any agent'."""
-    agent = agent_name(agent) or "agent"
-    queues = DATA / "queues"
-    mine, done = queues / agent, queues / "_read"
-    mine.mkdir(parents=True, exist_ok=True)
-    done.mkdir(parents=True, exist_ok=True)
-    mark_active(agent)
-    shared = queues / "any"
-    for p in sorted(shared.glob("*.json")) if shared.exists() else []:
-        try:
-            os.replace(p, mine / p.name)  # atomic: if two agents race, one gets it
-        except OSError:
-            pass
-    taken = []
-    for p in sorted(mine.glob("*.json")):
-        claimed = done / p.name
-        try:
-            os.replace(p, claimed)  # atomic: only one reader ever gets a message
-            meta = json.loads(claimed.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        meta["read_by"] = agent
-        try:
-            write_file(claimed, json.dumps(meta, indent=2).encode())
-        except OSError:
-            pass
-        taken.append(meta)
-    return taken
-
-
-def wait_for(agent, timeout):
+def wait_new(who, timeout):
+    """The notification: block until someone writes something new, then return it."""
     end = time.time() + max(0.0, float(timeout))
+    if not (DATA / "read" / (agent_name(who) or "anyone")).exists():
+        new_entries(who, first_time="skip")  # a first-time waiter starts at the end of the book
     while True:
-        got = take(agent)
-        if got or time.time() >= end:
-            return got
+        text = new_entries(who)
+        if text or time.time() >= end:
+            return text
         time.sleep(2)
-
-
-def render(meta):
-    if meta.get("kind") == "file":
-        return header(meta)
-    try:
-        return Path(meta["path"]).read_text(encoding="utf-8", errors="replace")
-    except (OSError, KeyError):
-        return header(meta) + "\n\n(message file missing)"
-
-
-def render_many(messages, agent):
-    if not messages:
-        return f"No new messages for {addr(agent_name(agent) or 'agent', NAME)}."
-    parts = [f"=== {i} of {len(messages)} ===\n{render(m)}" for i, m in enumerate(messages, 1)]
-    return "\n\n".join(parts) + "\n\n(answer with: reply <Id> \"text\")"
-
-
-def find_message(mid):
-    mid = clean_id(mid)
-    for p in (DATA / "queues").glob(f"*/*_{mid}.json"):
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            pass
-    return None
-
-
-def reply_message(mid, text, agent="", git=None):
-    meta = find_message(mid)
-    if not meta:
-        return mid, [(mid, False, "no received message with that id")]
-    subject = meta.get("subject") or ""
-    if subject and not subject.lower().startswith("re:"):
-        subject = "Re: " + subject
-    return send_message(addr(meta.get("from_agent"), meta.get("from")), text, subject=subject,
-                        reply_to=meta["id"], thread=meta.get("thread") or meta["id"], agent=agent, git=git)
-
-
-def open_work(agent):
-    """Messages this agent took but has not replied to yet: what to pick back up after a restart."""
-    agent = agent_name(agent) or "agent"
-    answered = set()
-    for p in (DATA / "sent").glob("*.json"):
-        try:
-            rec = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if rec.get("from_agent") == agent and rec.get("reply_to"):
-            answered.add(rec["reply_to"])
-    rows = []
-    for p in sorted((DATA / "queues" / "_read").glob("*.json")):
-        try:
-            meta = json.loads(p.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if meta.get("read_by") == agent and meta.get("id") not in answered:
-            rows.append(f"{meta.get('id')}  from {addr(meta.get('from_agent'), meta.get('from'))}  "
-                        f"thread {meta.get('thread')}  sent {meta.get('sent')}  {meta.get('subject') or '(no subject)'}")
-    if not rows:
-        return f"Nothing open for {addr(agent, NAME)}: every message you took has a reply."
-    return f"Taken by {addr(agent, NAME)} and not replied to yet:\n" + "\n".join(rows) + "\n(see one with: thread <Id>)"
-
-
-def thread_text(mid):
-    mid = clean_id(mid)
-    items = []
-    for p in (DATA / "queues").glob("*/*.json"):
-        try:
-            items.append(("in", json.loads(p.read_text(encoding="utf-8"))))
-        except (OSError, ValueError):
-            pass
-    for p in (DATA / "sent").glob("*.json"):
-        try:
-            items.append(("out", json.loads(p.read_text(encoding="utf-8"))))
-        except (OSError, ValueError):
-            pass
-    tid = next((m.get("thread") for _, m in items if m.get("id") == mid), mid)
-    chosen = sorted(((d, m) for d, m in items if m.get("thread") == tid), key=lambda x: x[1].get("sent") or "")
-    if not chosen:
-        return f"No messages found for {mid}."
-    out = []
-    for direction, m in chosen:
-        if direction == "in":
-            out.append(render(m))
-        else:
-            meta = dict(m, **{"from": NAME, "to_agent": "", "path": m.get("name")})
-            delivered = "   ".join(f"{n} {'delivered' if ok else 'FAILED - ' + str(d)}" for n, ok, d in m.get("results", []))
-            out.append(header(meta) + f"\nDelivered: {delivered}\n\n{m.get('text', '')}")
-    return f"Thread {tid}: {len(chosen)} message(s)\n\n" + "\n\n----\n\n".join(out)
-
-
-def peers_text():
-    now = time.time()
-    rows = []
-    with lock:
-        items = sorted(peers.items())
-    for name, info in items:
-        ago = now - (info.get("last_seen") or 0)
-        state = "online " if ago < ONLINE_WINDOW else "offline"
-        status = next(iter((info.get("status") or "").splitlines()), "")
-        rows.append(f"{name:16} {state}  v{info.get('version') or '<4'}  {info.get('ip') or '?':16} "
-                    f"seen {ago_text(ago):>8}   ram {info.get('ram')}%"
-                    f"   agents: {agents_text(info.get('agents')) or 'none'}" + (f"   status: {status}" if status else ""))
-    rows.append(f"{NAME:16} (this machine)  v{VERSION}   agents: {agents_text(agent_ages()) or 'none'}")
-    return "\n".join(rows)
 
 
 # ---- start, stop, status: one Pool per machine ----
@@ -797,14 +612,6 @@ def wired_from_node():
     return [ipaddress.IPv4Interface(x) for x in read_node().get("wired", [])]
 
 
-def prepare_to_send():
-    """A command-line or MCP sender borrows the running Pool's view of the wire and the machines."""
-    global wired
-    DATA.mkdir(parents=True, exist_ok=True)
-    load_peers()
-    wired = (wired_from_node() if node_running() else []) or find_wired()
-
-
 def stop_requested():
     return (DATA / "STOP").exists()
 
@@ -812,7 +619,7 @@ def stop_requested():
 def start_node(mode):
     global wired, node_mode, started_at
     lower_priority()
-    (DATA / "inbox").mkdir(parents=True, exist_ok=True)
+    DATA.mkdir(parents=True, exist_ok=True)
     (DATA / "my_status.txt").touch(exist_ok=True)
     load_peers()
     tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -862,7 +669,7 @@ def finish_node():
 
 def serve_forever():
     start_node("background")
-    print(f"The Pool is running as {NAME} with no window (Ctrl+C or 'pool.bat stop' ends it). Data: {DATA}")
+    print(f"The Pool is running as {NAME} with no window (Ctrl+C or 'pool.bat stop' ends it). Book: {BOOK}")
     try:
         while not stop_requested():
             time.sleep(2)
@@ -872,31 +679,30 @@ def serve_forever():
 
 
 def start_background():
-    """Start a windowless Pool that outlives the caller (Task Scheduler on Windows, systemd/setsid on Linux)."""
+    """Start a windowless Pool that outlives whoever asked: Task Scheduler on Windows, systemd on Linux."""
     if node_running():
         return 0, f"The Pool is already running on {NAME} ({read_node().get('mode', '?')})."
     if os.name == "nt":
-        result = subprocess.run(["schtasks", "/Run", "/TN", TASK], capture_output=True, text=True,
-                                creationflags=subprocess.CREATE_NO_WINDOW)
-        if result.returncode != 0:
-            return 1, f"The '{TASK}' scheduled task is missing: run SETUP_THE_POOL.bat once."
+        cmd = ["schtasks", "/Run", "/TN", TASK]
+        missing = f"The '{TASK}' scheduled task is missing: run SETUP_THE_POOL.bat once."
+    elif shutil.which("systemctl") and subprocess.run(["systemctl", "--user", "cat", "thepool.service"],
+                                                      capture_output=True).returncode == 0:
+        cmd, missing = ["systemctl", "--user", "start", "thepool.service"], "systemctl could not start thepool.service."
+    elif shutil.which("systemd-run"):
+        cmd = ["systemd-run", "--user", "--collect", "--quiet", "--unit", "thepool", sys.executable,
+               str(HERE / "pool.py"), "serve"]
+        missing = "systemd-run could not start it."
     else:
-        cmd = [sys.executable, str(HERE / "pool.py"), "serve"]
-        if shutil.which("systemd-run"):
-            subprocess.run(["systemd-run", "--user", "--collect", "--quiet", "--unit", "thepool", *cmd])
-        else:
-            subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 1, "No systemd here: run 'python3 pool.py serve' in a terminal you keep open."
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    if result.returncode != 0:
+        return 1, f"{missing} {(result.stderr or result.stdout).strip()[:300]}"
     for _ in range(40):
         time.sleep(0.5)
         if node_running():
             return 0, f"The Pool is running in the background on {NAME}."
     return 1, f"It did not start - see {DATA / 'log.txt'}"
-
-
-def ensure_node():
-    """Receiving needs the Pool running here; start it in the background if it is not."""
-    return "" if node_running() else start_background()[1]
 
 
 def stop_node():
@@ -916,15 +722,17 @@ def show_status():
     load_peers()
     ports = node.get("wired") if running else [str(w) for w in find_wired()]
     online = sorted(n for n, i in peers.items() if is_online(i)) if running else []
-    queues = DATA / "queues"
-    waiting = {q.name: len(list(q.glob("*.json"))) for q in queues.iterdir() if q.is_dir() and q.name != "_read"} \
-        if queues.exists() else {}
-    lines = [f"The Pool on {NAME}: running ({node.get('mode', '?')}, pid {node.get('pid', '?')}, "
-             f"since {node.get('started', '?')})" if running else f"The Pool on {NAME}: not running",
-             f"wired port: {', '.join(ports or []) or 'none - plug in a network cable'}",
-             f"machines online: {', '.join(online) or 'none'}",
-             "unread: " + (", ".join(f"{q} {n}" for q, n in sorted(waiting.items()) if n) or "none")]
-    return (0 if running else 1), "\n".join(lines)
+    size = BOOK.stat().st_size if BOOK.exists() else 0
+    first = ""
+    if size:
+        with open(BOOK, encoding="utf-8", errors="replace") as f:
+            first = f.readline()[1:11]
+    return (0 if running else 1), "\n".join([
+        f"The Pool on {NAME}: running ({node.get('mode', '?')}, pid {node.get('pid', '?')}, "
+        f"since {node.get('started', '?')})" if running else f"The Pool on {NAME}: not running",
+        f"wired port: {', '.join(ports or []) or 'none - plug in a network cable'}",
+        f"machines online: {', '.join(online) or 'none'}",
+        f"book: {BOOK} ({size // 1024} KB" + (f", since {first})" if first else ")")])
 
 
 def open_path(path):
@@ -934,106 +742,81 @@ def open_path(path):
         subprocess.Popen(["xdg-open", str(path)])
 
 
-def count_new():
-    try:
-        with open(DATA / "NEW.txt", encoding="utf-8") as f:
-            return sum(1 for line in f if line.strip())
-    except OSError:
-        return 0
-
-
-# ---- MCP server: the same commands as native tools in Claude Code and Codex ----
-
-def pool_command():
-    return str(HERE / "pool.bat") if os.name == "nt" else f"python3 {HERE / 'pool.py'}"
-
-
-def agent_guide(agent):
-    me = addr(agent_name(agent) or "agent", NAME)
-    return (f"The Pool links operator's machines over a wired cable. You are {me}. Use it to hand work to agents on "
-            "other machines and to get their results back.\n"
-            "- peers: which machines are online and which agents are active on them.\n"
-            "- send to agent@machine (codex@device1, claude@device4; a unique prefix like codex@minas works), "
-            "a bare machine (whichever agent there reads first) or all.\n"
-            "- Code never travels in messages: commit and push, then send with git_repo so the message names repo, "
-            "branch and commit; the receiver fetches exactly that commit.\n"
-            "- A task message says what to do, where the code is, and what to report back. The receiver answers "
-            "with reply (same thread) when done or blocked.\n"
-            "- read returns your new messages; wait blocks until one arrives. A message is taken once: after you "
-            "read it, it is yours to handle. After a restart, open lists what you took but have not replied to.\n"
-            "- A claim counts only once the task's sender (or the other instance) says yes in the thread; until "
-            "then no overlapping edits or heavy jobs. 'delivered' only means stored: a task is done when its "
-            "thread says so.\n"
-            f"- In Claude Code, for long waits run in the background: {pool_command()} wait --as "
-            f"{agent_name(agent) or 'agent'} --timeout 3600 (you are notified when it exits).\n"
-            "- Never put secrets in messages.")
-
+# ---- MCP server: the same as native tools in Claude Code and Codex ----
 
 def mcp_tools():
-    s, n = {"type": "string"}, {"type": "number"}
+    s = {"type": "string"}
 
     def tool(name, description, props, required):
         return {"name": name, "description": description,
                 "inputSchema": {"type": "object", "properties": props, "required": required}}
     return [
-        tool("send", "Send a message to an agent on another machine (or this one). to = agent@machine "
-             "(codex@device1; a unique prefix like codex@minas works), a bare machine (any agent there) or "
-             "'all'. Code goes through git: pass git_repo (a local repo path) so the message carries repo, branch "
-             "and commit.", {"to": s, "text": s, "subject": s, "git_repo": s}, ["to", "text"]),
-        tool("reply", "Answer a received message by its Id: same thread, back to the agent that sent it.",
-             {"id": s, "text": s, "git_repo": s}, ["id", "text"]),
-        tool("read", "Take and return your new messages (each message is taken once, by one agent).", {}, []),
-        tool("wait", "Block until a message for you arrives or timeout_seconds pass (default 50, max 110), "
-             "then return it.", {"timeout_seconds": n}, []),
-        tool("peers", "Machines in the pool: online or not, wired address, RAM use, active agents, status.", {}, []),
-        tool("thread", "The whole conversation (sent and received) that a message Id belongs to.", {"id": s}, ["id"]),
-        tool("open", "Messages you took but have not replied to yet: check after a restart to pick work back up.",
-             {}, []),
-        tool("send_file", "Send a file to an agent or machine; it lands in their inbox and they are notified.",
-             {"to": s, "path": s, "subject": s}, ["to", "path"]),
-        tool("status", "Whether the Pool runs on this machine, its wired port, who is online, unread counts.", {}, []),
+        tool("say", "Write in the Pool's book: every machine online gets it. Optional 'to' names who it is for "
+             "(codex@device1, claude@device4, or a machine).", {"text": s, "to": s}, ["text"]),
+        tool("read", "What was written in the book since you last read.", {}, []),
+        tool("wait", "Block until someone writes something new (up to timeout_seconds, default 50, max 110), "
+             "then return it.", {"timeout_seconds": {"type": "number"}}, []),
+        tool("peers", "Machines in the pool: online or not, RAM use, status.", {}, []),
     ]
 
 
-def call_tool(name, args, agent):
-    """Returns (text, is_error)."""
-    started = ensure_node()
-    prefix = (started + "\n") if started else ""
-    if name in ("send", "reply", "send_file"):
-        prepare_to_send()
-        git = git_info(args["git_repo"]) if args.get("git_repo") else None
-        if name == "send":
-            mid, results = send_message(args["to"], args["text"], args.get("subject", ""), agent=agent, git=git)
-        elif name == "reply":
-            mid, results = reply_message(args["id"], args["text"], agent=agent, git=git)
-        else:
-            mid, results = send_message(args["to"], args.get("subject", ""), args.get("subject", ""),
-                                        agent=agent, path=args["path"])
-        return prefix + sent_report(mid, results, git), not any(ok for _, ok, _ in results)
+def call_tool(name, args, who):
+    if name == "say":
+        prepare_to_write()
+        return said_text(say(args["text"], args.get("to", ""), who))
     if name == "read":
-        return prefix + render_many(take(agent), agent), False
+        return new_entries(who) or "Nothing new in the book."
     if name == "wait":
         timeout = min(max(float(args.get("timeout_seconds") or 50), 0), 110)
-        got = wait_for(agent, timeout)
-        return prefix + (render_many(got, agent) if got else f"Nothing arrived in {int(timeout)} s."), False
+        return wait_new(who, timeout) or f"Nothing new in {int(timeout)} s."
     if name == "peers":
         load_peers()
-        return prefix + peers_text(), False
-    if name == "thread":
-        return prefix + thread_text(args["id"]), False
-    if name == "open":
-        return prefix + open_work(agent), False
-    if name == "status":
-        return prefix + show_status()[1], False
-    return f"unknown tool {name}", True
+        return peers_text()
+    raise ValueError(f"unknown tool {name}")
 
 
-def mcp_serve(agent):
-    """MCP over stdio: one JSON-RPC message per line. Tool calls run in threads so a wait never blocks others."""
+def push_to_session(who, respond):
+    """The notification, no watcher needed: when someone else writes in the book, push it into the running
+    Claude Code session as a channel event (Claude started with: claude --dangerously-load-development-channels
+    server:pool). read still shows the same entries, so nothing is lost if the session ignores pushes."""
+    me = addr(agent_name(who) or "anyone", NAME)
+    seen = BOOK.stat().st_size if BOOK.exists() else 0
+    while True:
+        time.sleep(2)
+        size = BOOK.stat().st_size if BOOK.exists() else 0
+        if size <= seen:
+            seen = min(seen, size)  # the book was pruned
+            continue
+        with open(BOOK, "rb") as f:
+            f.seek(seen)
+            chunk = f.read(size - seen)
+        chunk = chunk[:chunk.rfind(b"\n") + 1]
+        seen += len(chunk)
+        entries, current = [], []
+        for line in chunk.decode("utf-8", "replace").splitlines(keepends=True):
+            if line.startswith("[") and current:
+                entries.append("".join(current))
+                current = []
+            current.append(line)
+        entries += ["".join(current)] if current else []
+        others = [e for e in entries if e.split("] ", 1)[-1].split(" -> ")[0].split("\n")[0].strip() != me]
+        if others:
+            respond({"jsonrpc": "2.0", "method": "notifications/claude/channel",
+                     "params": {"content": "New in the Pool book:\n" + "".join(others).rstrip(),
+                                "meta": {"machine": NAME}}})
+
+
+def mcp_serve(who):
+    """MCP over stdio: one JSON-RPC message per line; tool calls run in threads so a wait blocks nothing."""
     sys.stdin.reconfigure(encoding="utf-8")
     out = sys.stdout
     out.reconfigure(encoding="utf-8")
     write_lock = threading.Lock()
+    me = addr(agent_name(who) or "anyone", NAME)
+    guide = (f"The Pool is a shared book between operator's machines (wired). You are {me}. say writes in it and "
+             "every machine online gets it; read shows what is new; wait blocks until someone writes. Say who "
+             "a message is for with 'to'. Code goes through GitHub: name the commit, never paste code. "
+             "Never put secrets in the book.")
 
     def respond(message):
         with write_lock:
@@ -1042,11 +825,11 @@ def mcp_serve(agent):
 
     def run_tool(rid, params):
         try:
-            text, is_error = call_tool(params.get("name"), params.get("arguments") or {}, agent)
+            text, error = call_tool(params.get("name"), params.get("arguments") or {}, who), False
         except Exception as e:
-            text, is_error = f"{type(e).__name__}: {e}", True
+            text, error = f"{type(e).__name__}: {e}", True
         respond({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}],
-                                                          "isError": is_error}})
+                                                          "isError": error}})
 
     for line in sys.stdin:
         try:
@@ -1055,12 +838,14 @@ def mcp_serve(agent):
             continue
         rid, method, params = request.get("id"), request.get("method"), request.get("params") or {}
         if rid is None:
-            continue  # notifications (initialized, cancelled) need no answer
+            continue  # notifications need no answer
         if method == "initialize":
             respond({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": params.get("protocolVersion") or "2025-06-18",
-                "capabilities": {"tools": {}}, "serverInfo": {"name": "the-pool", "version": VERSION},
-                "instructions": agent_guide(agent)}})
+                "capabilities": {"tools": {}, "experimental": {"claude/channel": {}}},
+                "serverInfo": {"name": "the-pool", "version": "5"}, "instructions": guide}})
+            if "claude" in str((params.get("clientInfo") or {}).get("name", "")).lower():
+                threading.Thread(target=push_to_session, args=(who, respond), daemon=True).start()
         elif method == "tools/list":
             respond({"jsonrpc": "2.0", "id": rid, "result": {"tools": mcp_tools()}})
         elif method == "tools/call":
@@ -1071,7 +856,7 @@ def mcp_serve(agent):
             respond({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"unknown method {method}"}})
 
 
-# ---- the window: dark, with the painting as icon and banner ----
+# ---- the window: a dark chat box, with the painting as icon and banner ----
 
 PALETTE = {"bg": "#120f1a", "panel": "#1b1626", "field": "#241d33", "line": "#2e2640", "fg": "#ece6f4",
            "muted": "#9a90b0", "gold": "#f2a65a", "blue": "#7cc4ef", "sel": "#463766"}
@@ -1085,26 +870,17 @@ def dark_theme(root):
     style.theme_use("clam")
     style.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field"],
                     bordercolor=c["line"], lightcolor=c["line"], darkcolor=c["line"], troughcolor=c["panel"],
-                    selectbackground=c["sel"], selectforeground=c["fg"], insertcolor=c["fg"],
+                    selectbackground=c["sel"], selectforeground=c["fg"], insertcolor=c["fg"], arrowcolor=c["gold"],
                     font=("Segoe UI", 10))
-    style.configure("Treeview", background=c["panel"], fieldbackground=c["panel"], foreground=c["fg"],
-                    rowheight=26, borderwidth=0)
-    style.map("Treeview", background=[("selected", c["sel"])], foreground=[("selected", c["fg"])])
-    style.configure("Treeview.Heading", background=c["field"], foreground=c["muted"], relief="flat",
-                    font=("Segoe UI Semibold", 9))
-    style.map("Treeview.Heading", background=[("active", c["sel"])])
     style.configure("TButton", background=c["sel"], foreground=c["fg"], padding=(14, 5), relief="flat",
                     borderwidth=0)
     style.map("TButton", background=[("pressed", c["gold"]), ("active", "#5a4885")],
               foreground=[("pressed", c["bg"])])
-    style.configure("TCombobox", fieldbackground=c["field"], background=c["field"], foreground=c["fg"],
-                    arrowcolor=c["gold"], padding=4, insertcolor=c["fg"])
-    style.map("TCombobox", fieldbackground=[("readonly", c["field"])], foreground=[("readonly", c["fg"])],
-              selectbackground=[("readonly", c["field"])], selectforeground=[("readonly", c["fg"])])
+    style.configure("TCombobox", fieldbackground=c["field"], background=c["field"], foreground=c["fg"], padding=4)
+    style.configure("Vertical.TScrollbar", background=c["field"], troughcolor=c["panel"], borderwidth=0)
     root.option_add("*TCombobox*Listbox.background", c["field"])
     root.option_add("*TCombobox*Listbox.foreground", c["fg"])
     root.option_add("*TCombobox*Listbox.selectBackground", c["sel"])
-    style.configure("Section.TLabel", foreground=c["gold"], font=("Segoe UI Semibold", 9))
     style.configure("Muted.TLabel", foreground=c["muted"])
 
 
@@ -1146,8 +922,8 @@ def run_gui():
             pass
     root = tk.Tk()
     root.title(f"The Pool - {NAME}")
-    root.geometry("980x720")
-    root.minsize(780, 580)
+    root.geometry("900x720")
+    root.minsize(640, 520)
     dark_theme(root)
     c = PALETTE
     viewer = node_running()  # a background Pool already runs here: this window only shows it
@@ -1174,66 +950,72 @@ def run_gui():
         banner.create_text(30 + dx, 70 + dx, anchor="w", text="The Pool", fill=colour, font=("Georgia", 30, "bold"))
     subtitle = banner.create_text(33, 112, anchor="w", text="", fill="#d9cdef", font=("Segoe UI", 10))
 
-    body = ttk.Frame(root, padding=(18, 2, 18, 14))
+    body = ttk.Frame(root, padding=(18, 0, 18, 14))
     body.pack(fill="both", expand=True)
-    ttk.Label(body, text="MACHINES", style="Section.TLabel").pack(anchor="w", pady=(0, 4))
-    machines = ttk.Treeview(body, columns=("ip", "seen", "ram", "agents", "status"), height=5)
-    for col, title, width in (("#0", "Machine", 150), ("ip", "Address", 125), ("seen", "Last seen", 120),
-                              ("ram", "RAM", 60), ("agents", "Agents", 200), ("status", "Status", 260)):
-        machines.heading(col, text=title, anchor="w")
-        machines.column(col, width=width, stretch=(col == "status"), anchor="w")
-    machines.tag_configure("online", foreground=c["blue"])
-    machines.tag_configure("offline", foreground=c["muted"])
-    machines.pack(fill="x")
+    machines = ttk.Label(body, text="", style="Muted.TLabel")
+    machines.pack(anchor="w", pady=(0, 6))
 
-    ttk.Label(body, text="INBOX   newest first, double-click to open", style="Section.TLabel").pack(
-        anchor="w", pady=(14, 4))
-    inbox = tk.Listbox(body, height=9, bg=c["panel"], fg=c["fg"], selectbackground=c["sel"],
-                       selectforeground=c["fg"], highlightthickness=0, borderwidth=0, activestyle="none",
-                       font=("Segoe UI", 10))
-    inbox.pack(fill="both", expand=True)
-    inbox.bind("<Double-Button-1>", lambda _e: inbox.curselection() and
-               open_path(DATA / "inbox" / inbox.get(inbox.curselection()[0])))
+    pane = ttk.Frame(body)
+    pane.pack(fill="both", expand=True)
+    book = tk.Text(pane, wrap="word", bg=c["panel"], fg=c["fg"], relief="flat", highlightthickness=0,
+                   padx=12, pady=10, font=("Segoe UI", 10), spacing1=1, state="disabled", cursor="arrow")
+    scroll = ttk.Scrollbar(pane, orient="vertical", command=book.yview)
+    book.configure(yscrollcommand=scroll.set)
+    scroll.pack(side="right", fill="y")
+    book.pack(side="left", fill="both", expand=True)
+    book.tag_configure("head", foreground=c["gold"], font=("Segoe UI Semibold", 9), spacing1=8)
+    book.tag_configure("mine", foreground=c["blue"], font=("Segoe UI Semibold", 9), spacing1=8)
 
-    ttk.Label(body, text="SEND   to a machine, or agent@machine", style="Section.TLabel").pack(anchor="w", pady=(14, 4))
     compose = ttk.Frame(body)
-    compose.pack(fill="x")
+    compose.pack(fill="x", pady=(10, 0))
     ttk.Label(compose, text="To").grid(row=0, column=0, sticky="w")
-    target = ttk.Combobox(compose, width=28)
+    target = ttk.Combobox(compose, width=26)
+    target.set("everyone")
     target.grid(row=0, column=1, sticky="w", padx=8)
-    text = tk.Text(compose, height=4, wrap="word", bg=c["field"], fg=c["fg"], insertbackground=c["gold"],
+    text = tk.Text(compose, height=3, wrap="word", bg=c["field"], fg=c["fg"], insertbackground=c["gold"],
                    relief="flat", highlightthickness=1, highlightbackground=c["line"], highlightcolor=c["gold"],
                    padx=10, pady=8, font=("Segoe UI", 10))
     text.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(8, 0))
     compose.columnconfigure(4, weight=1)
-    note = ttk.Label(body, text="", style="Muted.TLabel")
-    note.pack(anchor="w", pady=(8, 0))
-    outcome = {"text": "", "clear": False}  # written by send threads, shown by refresh()
+    note = ttk.Label(body, text="Enter writes in the book, Shift+Enter makes a new line.", style="Muted.TLabel")
+    note.pack(anchor="w", pady=(6, 0))
+    outcome = {"text": ""}  # written by send threads, shown by refresh()
+    shown = {"size": 0, "targets": None}
 
-    def send_in_background(what, **kwargs):
+    def show(chunk):
+        book.configure(state="normal")
+        for line in chunk.splitlines(keepends=True):
+            if line.startswith("["):
+                author = line.split("] ", 1)[-1].split(" -> ")[0].strip()
+                book.insert("end", line, "mine" if author == NAME or author.endswith("@" + NAME) else "head")
+            else:
+                book.insert("end", line)
+        book.configure(state="disabled")
+        book.see("end")
+
+    def write(**kwargs):
         who = target.get().strip()
-        if not who:
-            note.config(text="Pick a machine first (or type agent@machine).")
-            return
-        note.config(text=f"Sending {what} to {who}...")
+        to = "" if who in ("", "everyone") else who
 
         def work():
-            mid, results = send_message(who, agent="operator", **kwargs)
-            outcome["clear"] = "path" not in kwargs and all(ok for _, ok, _ in results)
-            outcome["text"] = sent_report(mid, results)
+            outcome["text"] = said_text(say(to=to, who="operator", **kwargs))
         threading.Thread(target=work, daemon=True).start()
 
-    def send_prompt():
+    def send_text(_event=None):
         message = text.get("1.0", "end").strip()
         if message:
-            send_in_background("message", text=message)
+            text.delete("1.0", "end")
+            write(text=message)
+        return "break"
 
     def send_file():
         path = filedialog.askopenfilename(parent=root)
         if path:
-            send_in_background(Path(path).name, path=path)
+            write(text="", path=path)
 
-    ttk.Button(compose, text="Send message", command=send_prompt).grid(row=0, column=2, padx=(0, 6))
+    text.bind("<Return>", send_text)
+    text.bind("<Shift-Return>", lambda _e: None)
+    ttk.Button(compose, text="Write", command=send_text).grid(row=0, column=2, padx=(0, 6))
     ttk.Button(compose, text="Send file...", command=send_file).grid(row=0, column=3)
 
     def close():
@@ -1242,7 +1024,6 @@ def run_gui():
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", close)
-    shown = {"inbox": None, "targets": None}
 
     def refresh():
         global wired
@@ -1260,38 +1041,34 @@ def run_gui():
         now = time.time()
         with lock:
             rows = sorted((name, dict(info)) for name, info in peers.items())
-        machines.delete(*machines.get_children())
-        for name, info in rows:
-            ago = now - (info.get("last_seen") or 0)
-            online = ago < ONLINE_WINDOW
-            ram = f"{info['ram']}%" if info.get("ram") is not None else "?"
-            machines.insert("", "end", text=name, tags=("online" if online else "offline",),
-                            values=(info.get("ip"), ago_text(ago) if online else f"offline ({ago_text(ago)})", ram,
-                                    agents_text(info.get("agents")), (info.get("status") or "").replace("\n", " | ")))
-        targets = ("all", *(name for name, _ in rows),
-                   *(f"{a}@{name}" for name, info in rows for a in sorted(info.get("agents") or {})))
+        machines.config(text="Machines:  " + ("     ".join(
+            f"{n} ({'online, RAM ' + str(i.get('ram')) + '%' if now - (i.get('last_seen') or 0) < ONLINE_WINDOW else 'offline'})"
+            for n, i in rows) or "none seen yet"))
+        targets = ("everyone", *(n for n, _ in rows))
         if targets != shown["targets"]:
             shown["targets"] = targets
             target["values"] = targets
-        try:
-            stamp = (DATA / "inbox").stat().st_mtime_ns
-        except OSError:
-            stamp = None
-        if stamp != shown["inbox"]:
-            shown["inbox"] = stamp
-            inbox.delete(0, "end")
-            for name in sorted(os.listdir(DATA / "inbox"), reverse=True)[:300] if stamp else []:
-                inbox.insert("end", name)
-        waiting = count_new()
-        root.title(f"The Pool - {NAME}" + (f"   ({waiting} waiting in NEW.txt)" if waiting else ""))
+        size = BOOK.stat().st_size if BOOK.exists() else 0
+        if size < shown["size"]:  # the book was pruned: start over
+            book.configure(state="normal")
+            book.delete("1.0", "end")
+            book.configure(state="disabled")
+            shown["size"] = 0
+        if size > shown["size"]:
+            if shown["size"] == 0:
+                show(last_entries(300))
+            else:
+                with open(BOOK, "rb") as f:
+                    f.seek(shown["size"])
+                    show(f.read(size - shown["size"]).decode("utf-8", "replace"))
+            shown["size"] = size
         if outcome["text"]:
             note.config(text=outcome["text"])
-            if outcome["clear"]:
-                text.delete("1.0", "end")
-            outcome.update(text="", clear=False)
-        root.after(2000, refresh)
+            outcome["text"] = ""
+        root.after(1500, refresh)
 
     refresh()
+    text.focus_set()
     root.mainloop()
 
 
@@ -1303,36 +1080,31 @@ def main(argv):
     if not argv or argv[0] == "gui":
         run_gui()
         return 0
-    ap = argparse.ArgumentParser(prog="pool", description="The Pool: messages between your machines' agents.")
-    ap.add_argument("--as", dest="agent", default=AGENT, help="which agent you are: claude, codex, ... ($POOL_AGENT)")
+    ap = argparse.ArgumentParser(prog="pool", description="The Pool: a shared book your machines talk through.")
+    ap.add_argument("--as", dest="who", default=AGENT, help="who is writing: claude, codex, ... ($POOL_AGENT)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def command(name, *args):
         p = sub.add_parser(name)
-        p.add_argument("--as", dest="agent", default=argparse.SUPPRESS)
+        p.add_argument("--as", dest="who", default=argparse.SUPPRESS)
         for a in args:
             p.add_argument(a)
         return p
-    p = command("send", "to", "text")
-    p.add_argument("--subject", default="")
-    p.add_argument("--git", nargs="?", const=".", default=None, metavar="REPO")
-    p = command("reply", "id", "text")
-    p.add_argument("--git", nargs="?", const=".", default=None, metavar="REPO")
+    command("say", "text").add_argument("--to", default="")
     command("read")
     command("wait").add_argument("--timeout", type=float, default=600)
-    command("thread", "id")
-    command("open")
-    command("sendfile", "to", "path").add_argument("--subject", default="")
+    command("book").add_argument("n", nargs="?", type=int, default=20)
+    command("sendfile", "path").add_argument("--to", default="")
     for name in ("peers", "start", "stop", "status", "serve", "mcp"):
         command(name)
     args = ap.parse_args(argv)
-    agent = args.agent
+    who = args.who
 
     if args.cmd == "serve":
         serve_forever()
         return 0
     if args.cmd == "mcp":
-        mcp_serve(agent)
+        mcp_serve(who)
         return 0
     DATA.mkdir(parents=True, exist_ok=True)
     if args.cmd in ("start", "stop", "status"):
@@ -1343,40 +1115,23 @@ def main(argv):
         load_peers()
         print(peers_text())
         return 0
-    if args.cmd in ("send", "reply", "sendfile"):
-        prepare_to_send()
-        git = None
-        if getattr(args, "git", None):
-            try:
-                git = git_info(args.git)
-            except ValueError as e:
-                print(e)
-                return 2
-        if args.cmd == "send":
-            message = sys.stdin.read() if args.text == "-" else args.text
-            mid, results = send_message(args.to, message, args.subject, agent=agent, git=git)
-        elif args.cmd == "reply":
-            message = sys.stdin.read() if args.text == "-" else args.text
-            mid, results = reply_message(args.id, message, agent=agent, git=git)
+    if args.cmd in ("say", "sendfile"):
+        prepare_to_write()
+        if args.cmd == "say":
+            results = say(sys.stdin.read() if args.text == "-" else args.text, args.to, who)
         else:
-            mid, results = send_message(args.to, args.subject, args.subject, agent=agent, path=args.path)
-        print(sent_report(mid, results, git))
-        return 0 if results and all(ok for _, ok, _ in results) else 1
-    started = ensure_node()
-    if started:
-        print(started)
+            results = say("", args.to, who, path=args.path)
+        print(said_text(results))
+        return 0 if all(ok for _, ok, _ in results) else 1
     if args.cmd == "read":
-        print(render_many(take(agent), agent))
+        print(new_entries(who) or "Nothing new in the book.", end="")
         return 0
     if args.cmd == "wait":
-        got = wait_for(agent, args.timeout)
-        print(render_many(got, agent) if got else f"Nothing arrived in {int(args.timeout)} s.")
-        return 0 if got else 3
-    if args.cmd == "thread":
-        print(thread_text(args.id))
-        return 0
-    if args.cmd == "open":
-        print(open_work(agent))
+        text = wait_new(who, args.timeout)
+        print(text or f"Nothing new in {int(args.timeout)} s.", end="" if text else "\n")
+        return 0 if text else 3
+    if args.cmd == "book":
+        print(last_entries(max(1, args.n)) or "The book is empty.", end="")
         return 0
     return 2
 
