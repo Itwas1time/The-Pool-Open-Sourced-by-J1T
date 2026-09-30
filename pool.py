@@ -201,7 +201,7 @@ def write_in_book(stamp, who, machine, to, text):
     head = f"[{stamp}] {addr(who, machine)}" + (f" -> {to}" if to else "")
     body = "\n".join("  " + line for line in (str(text).splitlines() or [""]))
     DATA.mkdir(parents=True, exist_ok=True)
-    with book_lock, open(BOOK, "a", encoding="utf-8") as f:
+    with book_lock, open(BOOK, "a", encoding="utf-8", newline="\n") as f:
         f.write(f"{head}\n{body}\n")  # one write per entry
 
 
