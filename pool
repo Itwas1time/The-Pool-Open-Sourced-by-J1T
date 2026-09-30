@@ -1,0 +1,9 @@
+#!/bin/sh
+# The Pool from Git Bash / Linux shells. Unlike pool.bat (cmd.exe), this keeps multi-line text intact:
+#   ./pool --as claude say "line one
+#   line two" --to codex@minas
+here="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$here/runtime/thepool-cli.exe" ]; then
+    exec "$here/runtime/thepool-cli.exe" "$here/pool.py" "$@"
+fi
+exec python3 "$here/pool.py" "$@"

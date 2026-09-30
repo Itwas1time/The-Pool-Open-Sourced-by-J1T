@@ -441,20 +441,24 @@ def receive(msg):
         write_file(path, base64.b64decode(msg.get("data", "")))
         text = f"(file) {msg.get('name', 'file')}  saved at {path}" + (f"\n{text}" if text else "")
     write_in_book(stamp, who, machine, to, text)
-    if machine != NAME:
-        notify_here(f"New in the Pool book from {addr(who, machine)}" + (f" to {to}" if to else "") +
+    if machine != NAME and (not to or to == NAME or to.endswith("@" + NAME)):  # only what is meant for here
+        notify_here(to, f"New in the Pool book from {addr(who, machine)}" + (f" to {to}" if to else "") +
                     f":\n{text[:1500]}\n(Read the book with the pool read tool or: pool read)")
 
 
-def notify_here(message):
+def notify_here(to, message):
     """The notification, no watcher needed: run this machine's own notify command from pool_data/notify.json,
-    {"command": [..., "{message}", ...]}. To deliver into an existing Codex session (Linux), register it from
-    that session with: python3 pool_codex_notify.py --thread <id> --register
+    {"command": [..., "{message}", ...], "agent": "optional: only wake for entries to this agent or everyone"}.
+    To deliver into an existing Codex session, register it from that session with:
+    python3 pool_codex_notify.py --register   (Windows: add --proxy <native codex.exe>)
     The words only ever go in as text; nothing received is executed."""
     try:
-        command = json.loads((DATA / "notify.json").read_text(encoding="utf-8"))["command"]
-        args = [str(a).replace("{message}", message) for a in command]
-    except (OSError, ValueError, KeyError, TypeError):
+        hook = json.loads((DATA / "notify.json").read_text(encoding="utf-8"))
+        agent = agent_name(hook.get("agent"))
+        if agent and to not in ("", NAME, f"{agent}@{NAME}"):
+            return  # addressed to another agent on this machine
+        args = [str(a).replace("{message}", message) for a in hook["command"]]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return
 
     def run():
