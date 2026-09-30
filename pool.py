@@ -512,8 +512,8 @@ def serve_tcp(server):
 def mention(to):
     """Tidy a --to mention: 'codex@minas' -> 'codex@device1'."""
     who, _, machine = str(to or "").strip().lower().rpartition("@")
-    if not machine:
-        return ""
+    if machine in ("", "all", "everyone", "pool"):
+        return ""  # the whole pool
     machine = canonical(machine)
     with lock:
         known = list(peers) + [NAME]
@@ -540,8 +540,11 @@ def deliver(name, info, data):
 
 
 def say(text, to="", who="", path=None):
-    """Write in the book here and on every online machine. Returns [(machine, ok, detail)]."""
-    body = {"kind": "file" if path else "chat", "from": NAME, "who": agent_name(who), "to": mention(to),
+    """Write in the book here and send it on. No 'to' (or 'all'): a pool message, every online machine gets it.
+    'to' = agent@machine or machine: a direct message, only that machine gets it. Returns [(machine, ok, detail)]."""
+    to = mention(to)
+    target = to.rpartition("@")[2]
+    body = {"kind": "file" if path else "chat", "from": NAME, "who": agent_name(who), "to": to,
             "text": text, "sent_at": datetime.now().isoformat(timespec="seconds")}
     if path:
         body.update(name=Path(path).name, data=base64.b64encode(Path(path).read_bytes()).decode())
@@ -550,7 +553,14 @@ def say(text, to="", who="", path=None):
         return [("", False, "too big (limit is about 15 MB)")]
     receive(dict(body))  # my own copy of the book
     with lock:
-        targets = [(n, dict(i)) for n, i in sorted(peers.items()) if is_online(i)]
+        if not target:
+            targets = [(n, dict(i)) for n, i in sorted(peers.items()) if is_online(i)]
+        elif target == NAME:
+            targets = []  # an agent on this machine: my own book is where it reads
+        elif target in peers:
+            targets = [(target, dict(peers[target]))]
+        else:
+            return [(target, False, "unknown machine (not seen on the wire yet)")]
     results = [deliver(name, info, data) for name, info in targets]
     for name, ok, detail in results:
         if not ok:
@@ -560,7 +570,7 @@ def say(text, to="", who="", path=None):
 
 def said_text(results):
     if not results:
-        return "Written in this machine's book; no other machine is online."
+        return "Written in this machine's book (for an agent here, or no other machine is online)."
     if results[0][0] == "":
         return f"Not written: {results[0][2]}"
     return "Written. " + "   ".join(f"{n}: {'delivered' if ok else 'NOT delivered - ' + d}" for n, ok, d in results)
@@ -779,8 +789,9 @@ def mcp_tools():
         return {"name": name, "description": description,
                 "inputSchema": {"type": "object", "properties": props, "required": required}}
     return [
-        tool("say", "Write in the Pool's book: every machine online gets it. Optional 'to' names who it is for "
-             "(codex@device1, claude@device4, or a machine).", {"text": s, "to": s}, ["text"]),
+        tool("say", "Write in the Pool's book. Without 'to' it is a pool message: every machine online gets it. "
+             "With 'to' (agent@machine like codex@device1, or just a machine) it is a direct message: only "
+             "that machine gets it.", {"text": s, "to": s}, ["text"]),
         tool("read", "What was written in the book since you last read.", {}, []),
         tool("wait", "Block until someone writes something new (up to timeout_seconds, default 50, max 110), "
              "then return it.", {"timeout_seconds": {"type": "number"}}, []),
@@ -834,10 +845,10 @@ def mcp_serve(who):
     out.reconfigure(encoding="utf-8")
     write_lock = threading.Lock()
     me = addr(agent_name(who) or "anyone", NAME)
-    guide = (f"The Pool is a shared book between operator's machines (wired). You are {me}. say writes in it and "
-             "every machine online gets it; read shows what is new; wait blocks until someone writes. Say who "
-             "a message is for with 'to'. Code goes through GitHub: name the commit, never paste code. "
-             "Never put secrets in the book.")
+    guide = (f"The Pool is a shared book between operator's machines (wired). You are {me}. say without 'to' is a "
+             "pool message (every machine gets it); say with 'to' (agent@machine or a machine) is a direct "
+             "message (only that machine gets it). read shows what is new; wait blocks until something for you "
+             "is written. Code goes through GitHub: name the commit, never paste code. Never put secrets in the book.")
 
     def respond(message):
         with write_lock:
