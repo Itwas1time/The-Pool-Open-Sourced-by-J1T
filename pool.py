@@ -447,9 +447,10 @@ def receive(msg):
 
 
 def notify_here(message):
-    """The notification, no watcher needed: run this machine's own notify command from
-    pool_data/notify.json, e.g. {"command": ["codex", "queue", "--thread", "<id>", "--message", "{message}"]}
-    to wake a Codex session. The words only ever go in as text; nothing received is executed."""
+    """The notification, no watcher needed: run this machine's own notify command from pool_data/notify.json,
+    {"command": [..., "{message}", ...]}. To deliver into an existing Codex session (Linux), register it from
+    that session with: python3 pool_codex_notify.py --thread <id> --register
+    The words only ever go in as text; nothing received is executed."""
     try:
         command = json.loads((DATA / "notify.json").read_text(encoding="utf-8"))["command"]
         args = [str(a).replace("{message}", message) for a in command]
@@ -590,11 +591,10 @@ def wait_new(who, timeout):
     me = addr(agent_name(who) or "anyone", NAME)
     if not (DATA / "read" / (agent_name(who) or "anyone")).exists():
         new_entries(who, first_time="skip")  # a first-time waiter starts at the end of the book
-    got = []
     while True:
-        got += split_entries(new_entries(who))
-        if any(author(e) != me for e in got) or time.time() >= end:
-            return "".join(got) if any(author(e) != me for e in got) else ""
+        others = [e for e in split_entries(new_entries(who)) if author(e) != me]
+        if others or time.time() >= end:
+            return "".join(others)
         time.sleep(2)
 
 
