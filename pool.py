@@ -13,6 +13,7 @@ works: codex@minas), a bare MACHINE (whichever agent there reads first) or all.
   pool.bat read                                          print and take my new messages
   pool.bat wait [--timeout SECONDS]                      block until a message arrives, then read it
   pool.bat thread ID                                     the whole conversation
+  pool.bat open                                          what I took but have not replied to yet
   pool.bat sendfile TO PATH                              send a file
   pool.bat peers                                         machines, their agents, their status
   pool.bat start | stop | status | serve                 the Pool itself (start = background, no window)
@@ -696,6 +697,31 @@ def reply_message(mid, text, agent="", git=None):
                         reply_to=meta["id"], thread=meta.get("thread") or meta["id"], agent=agent, git=git)
 
 
+def open_work(agent):
+    """Messages this agent took but has not replied to yet: what to pick back up after a restart."""
+    agent = agent_name(agent) or "agent"
+    answered = set()
+    for p in (DATA / "sent").glob("*.json"):
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if rec.get("from_agent") == agent and rec.get("reply_to"):
+            answered.add(rec["reply_to"])
+    rows = []
+    for p in sorted((DATA / "queues" / "_read").glob("*.json")):
+        try:
+            meta = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if meta.get("read_by") == agent and meta.get("id") not in answered:
+            rows.append(f"{meta.get('id')}  from {addr(meta.get('from_agent'), meta.get('from'))}  "
+                        f"thread {meta.get('thread')}  sent {meta.get('sent')}  {meta.get('subject') or '(no subject)'}")
+    if not rows:
+        return f"Nothing open for {addr(agent, NAME)}: every message you took has a reply."
+    return f"Taken by {addr(agent, NAME)} and not replied to yet:\n" + "\n".join(rows) + "\n(see one with: thread <Id>)"
+
+
 def thread_text(mid):
     mid = clean_id(mid)
     items = []
@@ -934,7 +960,10 @@ def agent_guide(agent):
             "- A task message says what to do, where the code is, and what to report back. The receiver answers "
             "with reply (same thread) when done or blocked.\n"
             "- read returns your new messages; wait blocks until one arrives. A message is taken once: after you "
-            "read it, it is yours to handle.\n"
+            "read it, it is yours to handle. After a restart, open lists what you took but have not replied to.\n"
+            "- A claim counts only once the task's sender (or the other instance) says yes in the thread; until "
+            "then no overlapping edits or heavy jobs. 'delivered' only means stored: a task is done when its "
+            "thread says so.\n"
             f"- In Claude Code, for long waits run in the background: {pool_command()} wait --as "
             f"{agent_name(agent) or 'agent'} --timeout 3600 (you are notified when it exits).\n"
             "- Never put secrets in messages.")
@@ -958,6 +987,8 @@ def mcp_tools():
              "then return it.", {"timeout_seconds": n}, []),
         tool("peers", "Machines in the pool: online or not, wired address, RAM use, active agents, status.", {}, []),
         tool("thread", "The whole conversation (sent and received) that a message Id belongs to.", {"id": s}, ["id"]),
+        tool("open", "Messages you took but have not replied to yet: check after a restart to pick work back up.",
+             {}, []),
         tool("send_file", "Send a file to an agent or machine; it lands in their inbox and they are notified.",
              {"to": s, "path": s, "subject": s}, ["to", "path"]),
         tool("status", "Whether the Pool runs on this machine, its wired port, who is online, unread counts.", {}, []),
@@ -990,6 +1021,8 @@ def call_tool(name, args, agent):
         return prefix + peers_text(), False
     if name == "thread":
         return prefix + thread_text(args["id"]), False
+    if name == "open":
+        return prefix + open_work(agent), False
     if name == "status":
         return prefix + show_status()[1], False
     return f"unknown tool {name}", True
@@ -1288,6 +1321,7 @@ def main(argv):
     command("read")
     command("wait").add_argument("--timeout", type=float, default=600)
     command("thread", "id")
+    command("open")
     command("sendfile", "to", "path").add_argument("--subject", default="")
     for name in ("peers", "start", "stop", "status", "serve", "mcp"):
         command(name)
@@ -1340,6 +1374,9 @@ def main(argv):
         return 0 if got else 3
     if args.cmd == "thread":
         print(thread_text(args.id))
+        return 0
+    if args.cmd == "open":
+        print(open_work(agent))
         return 0
     return 2
 
