@@ -1,0 +1,15 @@
+pool_data/
+__pycache__/
+*.pyc
+
+pool_config.json
+
+pool_config.local.json
+
+.env
+
+.env.*
+
+*.pem
+
+*.key
