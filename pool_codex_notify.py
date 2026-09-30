@@ -7,7 +7,9 @@ Register once from that session:
 The Pool's receive hook then runs this command once per remote entry. It uses
 the running Codex app-server's Unix WebSocket and turn/start.toolOutput, so the
 entry reaches an active turn or wakes an idle session as tool output. No new
-session, model process, shell command, or API key is created. Requires Codex's
+session, model process, shell command, or API key is created. On Windows, add
+--proxy <native-codex.exe> to use Codex's socket transport over stdin/stdout.
+Requires Codex's
 experimental toolOutput API (verified with CLI/app-server 0.159.2 on Linux).
 """
 
@@ -17,12 +19,71 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import queue
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
+
+
+class ProxySocket:
+    """Socket-like bytes through Codex's proxy; it starts no agent/server."""
+
+    def __init__(self, executable):
+        self.executable = executable
+        self.timeout = 10
+        self.process = None
+        self.chunks = queue.Queue()
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def connect(self, path):
+        self.process = subprocess.Popen(
+            [str(self.executable), "app-server", "proxy", "--sock", path],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            bufsize=0, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+
+        def read():
+            try:
+                while True:
+                    chunk = self.process.stdout.read(65536)
+                    self.chunks.put(chunk)
+                    if not chunk:
+                        return
+            except (OSError, ValueError):
+                self.chunks.put(b"")
+
+        threading.Thread(target=read, daemon=True).start()
+
+    def recv(self, size):
+        try:
+            return self.chunks.get(timeout=self.timeout)
+        except queue.Empty:
+            raise TimeoutError("Codex proxy did not respond; check its executable and socket path")
+
+    def sendall(self, payload):
+        view = memoryview(payload)
+        while view:
+            written = self.process.stdin.write(view)
+            if not written:
+                raise RuntimeError("Codex proxy input closed")
+            view = view[written:]
+
+    def close(self):
+        if self.process:
+            self.process.stdin.close()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()  # only this one-shot native transport
+                self.process.wait(timeout=2)
+            self.process.stdout.close()
 
 
 class CodexRPC:
@@ -30,14 +91,19 @@ class CodexRPC:
 
     MAX_BYTES = 16 * 1024 * 1024
 
-    def __init__(self, path=None, timeout=10):
+    def __init__(self, path=None, timeout=10, proxy=None):
         self.timeout = timeout
         self.deadline = time.monotonic() + timeout
         self.buffer = b""
         self.rid = 0
         home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
         path = path or home / "app-server-control/app-server-control.sock"
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if proxy:
+            self.sock = ProxySocket(proxy)
+        elif hasattr(socket, "AF_UNIX"):
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        else:
+            raise ValueError("This Python has no AF_UNIX; provide --proxy <native-codex.exe>")
         try:
             self.sock.settimeout(timeout)
             self.sock.connect(str(path))
@@ -145,13 +211,17 @@ def register(args):
     command = [sys.executable, str(Path(__file__).resolve()), "--thread", args.thread]
     if args.socket:
         command += ["--socket", str(args.socket.resolve())]
+    if args.proxy:
+        command += ["--proxy", str(args.proxy.resolve())]
     command += ["--message", "{message}"]
     folder = args.pool_dir.resolve() / "pool_data"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / "notify.json"
     value = {"command": command}
-    if path.exists() and json.loads(path.read_text(encoding="utf-8")) != value:
-        raise ValueError(f"Existing notification hook preserved: {path}")
+    if path.exists():
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if existing != value and existing.get("command", [])[:2] != command[:2]:
+            raise ValueError(f"Existing notification hook preserved: {path}")
     fd, temporary = tempfile.mkstemp(prefix=".notify-", dir=folder)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as output:
@@ -170,6 +240,7 @@ def main():
     parser.add_argument("--thread", default=os.environ.get("CODEX_THREAD_ID"))
     parser.add_argument("--message")
     parser.add_argument("--socket", type=Path)
+    parser.add_argument("--proxy", type=Path, help="native Codex executable for the socket proxy (Windows)")
     parser.add_argument("--register", action="store_true")
     parser.add_argument("--pool-dir", type=Path, default=Path(__file__).resolve().parent)
     args = parser.parse_args()
@@ -178,7 +249,7 @@ def main():
     client = None
     try:
         args.thread = str(uuid.UUID(args.thread))
-        client = CodexRPC(args.socket)
+        client = CodexRPC(args.socket, proxy=args.proxy)
         if args.register:
             result = client.call("thread/read", {"threadId": args.thread, "includeTurns": False})
             if result["thread"]["status"]["type"] == "notLoaded":
