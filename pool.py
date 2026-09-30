@@ -584,6 +584,13 @@ def author(entry):
     return entry.split("] ", 1)[-1].split("\n")[0].split(" -> ")[0].strip()
 
 
+def for_me(entry, me):
+    """Written by someone else, and addressed to me, to my machine, or to everyone."""
+    head = entry.split("\n")[0]
+    to = head.split(" -> ", 1)[1].strip() if " -> " in head else ""
+    return author(entry) != me and to in ("", me, NAME)
+
+
 def wait_new(who, timeout):
     """The notification: block until someone else writes something new, then return it (your own
     writes never wake you). In Claude Code, run it in the background: the session wakes when it exits."""
@@ -592,9 +599,9 @@ def wait_new(who, timeout):
     if not (DATA / "read" / (agent_name(who) or "anyone")).exists():
         new_entries(who, first_time="skip")  # a first-time waiter starts at the end of the book
     while True:
-        others = [e for e in split_entries(new_entries(who)) if author(e) != me]
-        if others or time.time() >= end:
-            return "".join(others)
+        mine = [e for e in split_entries(new_entries(who)) if for_me(e, me)]
+        if mine or time.time() >= end:
+            return "".join(mine)
         time.sleep(2)
 
 
@@ -809,7 +816,7 @@ def push_to_session(who, respond):
             chunk = f.read(size - seen)
         chunk = chunk[:chunk.rfind(b"\n") + 1]
         seen += len(chunk)
-        others = [e for e in split_entries(chunk.decode("utf-8", "replace")) if author(e) != me]
+        others = [e for e in split_entries(chunk.decode("utf-8", "replace")) if for_me(e, me)]
         if others:
             respond({"jsonrpc": "2.0", "method": "notifications/claude/channel",
                      "params": {"content": "New in the Pool book:\n" + "".join(others).rstrip(),
