@@ -7,11 +7,15 @@ to each other over TCP on that same wire. Everything received is
 saved as a plain file in pool_data/inbox and announced by one line in
 pool_data/NEW.txt, so a small watcher script knows there is something to read.
 
-  pythonw pool.py                     open the window
-  python pool.py serve                run with no window
-  python pool.py peers                list known machines
-  python pool.py send NAME "text"     send a prompt (NAME can be 'all'; text '-' reads stdin)
-  python pool.py sendfile NAME PATH   send a file (NAME can be 'all')
+  START_THE_POOL.bat                  open the window
+  pool.bat serve                      run with no window
+  pool.bat peers                      list known machines
+  pool.bat send NAME "text"           send a prompt (NAME can be 'all'; text '-' reads stdin)
+  pool.bat sendfile NAME PATH         send a file (NAME can be 'all')
+
+On Windows the Pool runs as runtime\\thepool.exe / thepool-cli.exe (made once by
+SETUP_THE_POOL.bat) so local project's firewall block on python.exe is never involved.
+On Linux: python3 pool.py [same arguments].
 
 Standard library only. It sleeps between events and runs at below-normal
 priority, so it never competes with a game or anything else doing real work.
@@ -382,7 +386,11 @@ def send(target, body):
                 reply = f.readline(300).decode("utf-8", "replace").strip()
             results.append((name, reply == "OK", reply or "no reply"))
         except OSError as e:
-            results.append((name, False, str(e)))
+            if getattr(e, "winerror", None) == 10013:
+                results.append((name, False, "blocked by the firewall - use pool.bat or START_THE_POOL.bat, "
+                                             "not python.exe"))
+            else:
+                results.append((name, False, str(e)))
     for name, ok, detail in results:
         log(f"sent {body.get('kind')} to {name}: {'OK' if ok else detail}")
     return results
