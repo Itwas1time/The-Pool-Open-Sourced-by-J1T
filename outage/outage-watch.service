@@ -1,0 +1,15 @@
+[Unit]
+Description=local project outage watcher: ONLINE <machine> on the Pool when the internet returns, rebirth exactly once
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 %h/outage/outage_watch.py run
+Restart=on-failure
+RestartSec=60
+# never take a reborn process down with the watcher
+KillMode=process
+Nice=10
+
+[Install]
+WantedBy=default.target
