@@ -829,6 +829,10 @@ def cmd_rebirth(args):
     st = load_state()
     if st.get("phase") in (None, "idle"):
         st = {"phase": "offline", "outage_id": args.id or f"manual-{now():%Y%m%d-%H%M}"}
+    elif st.get("phase") in ("armed", "expired", "disarmed") and not args.force:
+        print(f"phase {st.get('phase')}: no outage seen, so a rebirth now would use up this outage's stamps and end the "
+              f"watcher. Use 'preview' to look; '--force' only if you mean it.")
+        return 2
     if not take_lock():
         print("a watcher is running here: post 'REBIRTH <machine>' on the Pool instead, it acts on that")
         return 2
@@ -879,6 +883,7 @@ def watch(args):
         save_state(st)
         if trig and phase in ("armed", "offline"):
             st["offline_since"] = st.get("offline_since") or "none seen"
+            st.setdefault("lanes_at_outage", st.get("lanes_seen") or {})
             st["online_at"] = iso()
             st["phase"] = "online"
             save_state(st)
@@ -950,6 +955,7 @@ def main(argv):
         r.add_argument("--ack-wait", type=float, default=900)
         r.add_argument("--snapshot-every", type=float, default=600)
         r.add_argument("--id", default=None)
+        r.add_argument("--force", action="store_true", help="rebirth: run even though no outage was seen")
     args = ap.parse_args(argv)
     if args.home:
         HOME = Path(args.home)
