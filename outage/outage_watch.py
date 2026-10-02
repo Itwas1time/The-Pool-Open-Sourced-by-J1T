@@ -232,15 +232,66 @@ def book_trigger(st):
     return found
 
 
+# ---------------------------------------------------------------- the judged-run rule (device4)
+
+RUN_ACTIVE_FILE = Path(os.environ.get("OUTAGE_RUN_ACTIVE") or (DOCKET / "RUN_ACTIVE"))
+
+
+def run_active():
+    """Operator box rule: while C:/tmp/docket/RUN_ACTIVE exists a judged game runs and NOTHING is launched on device4.
+    In-process only (no child process): the flag counts while its run dir (bughunt/run_<n>) was written in the last
+    10 min, or, if the run dir is unknown, while the flag is younger than 6 h. A flag left behind after the run ended
+    (a deaf operator cannot remove it) does not hold the rebirth forever. Returns '' or the reason."""
+    if not WIN:
+        return ""
+    try:
+        text = RUN_ACTIVE_FILE.read_text(encoding="utf-8", errors="replace")
+        age = time.time() - RUN_ACTIVE_FILE.stat().st_mtime
+    except OSError:
+        return ""
+    m = re.search(r"run[ _](\d+)", text)
+    d = DOCKET / "bughunt" / f"run_{m.group(1)}" if m else None
+    if d is not None and d.is_dir():
+        try:
+            newest = max((f.stat().st_mtime for f in d.iterdir() if f.is_file()), default=0.0)
+        except OSError:
+            newest = time.time()
+        if time.time() - newest < 600:
+            return f"judged run alive ({text.strip()[:80]}; {d.name} written {int(time.time() - newest)} s ago)"
+        return ""
+    return f"RUN_ACTIVE present ({text.strip()[:80]}), run dir unknown" if age < 6 * 3600 else ""
+
+
 # ---------------------------------------------------------------- probes
 
+def connectivity_hint():
+    """Windows' own verdict (NCSI), read in-process: True = internet access. No child process, no socket of ours."""
+    import ctypes
+
+    class Hint(ctypes.Structure):
+        _fields_ = [("level", ctypes.c_int), ("cost", ctypes.c_int), ("near_limit", ctypes.c_ubyte),
+                    ("over_limit", ctypes.c_ubyte), ("roaming", ctypes.c_ubyte)]
+    h = Hint()
+    if ctypes.windll.iphlpapi.GetNetworkConnectivityHint(ctypes.byref(h)) != 0:
+        return None
+    return h.level in (3, 4)  # internet access, constrained internet access
+
+
 def probe(probe_file=None):
-    """True when the internet answers: any HTTP status from any probe URL (HEAD, no secrets)."""
+    """True when the internet answers: any HTTP status from any probe URL (HEAD, no secrets). While a judged run is
+    live on device4, Windows' own connectivity verdict is read in-process instead (the box rule: launch nothing)."""
     if probe_file:
         try:
             return Path(probe_file).read_text(encoding="utf-8").strip().lower() == "up"
         except OSError:
             return False
+    if WIN and run_active():
+        try:
+            hint = connectivity_hint()
+            if hint is not None:
+                return hint
+        except Exception:
+            pass
     for url in PROBE_URLS:
         try:
             r = subprocess.run([CURL, "-s", "-o", os.devnull, "-I", "--max-time", "10", "-w", "%{http_code}", url],
@@ -637,6 +688,15 @@ def do_rebirth(st, args, reason):
     if not st.get("online_posted"):
         st["online_posted"] = pool_say(online_line)
         save_state(st)
+    held = run_active()
+    if held:
+        log(f"HOLDING every launch: {held}")
+        pool_say(f"REBIRTH {MACHINE} holding: {held}. Lanes and the operator terminal start when it ends.",
+                 to="operator@device4")
+        while run_active():
+            touch_lock()
+            time.sleep(60)
+        log("judged run over: launches proceed")
     children, actions, pending = [], [], []
     for e in entries:
         kind = e.get("kind", "sol_lane")
@@ -674,7 +734,7 @@ def supervise(children, pending=(), st=None):
     follow_until = time.time() + 1800
     while children or (pending and time.time() < follow_until):
         touch_lock()
-        if pending:
+        if pending and not run_active():
             alive = sol_lanes_alive()
             for e in list(pending):
                 if alive is None or e["name"] in alive:
@@ -899,7 +959,7 @@ def watch(args):
             phase = "offline"
         up = probe(args.probe_file)
         if phase == "armed":
-            if WIN and time.time() - last_snap > args.snapshot_every:
+            if WIN and time.time() - last_snap > args.snapshot_every and not run_active():
                 snap = sol_lanes_alive()
                 if snap is not None:
                     st["lanes_seen"] = snap
@@ -908,7 +968,7 @@ def watch(args):
                 last_snap = time.time()
             fails = 0 if up else fails + 1
             if fails >= args.offline_after:
-                snap = sol_lanes_alive() if WIN else {}
+                snap = sol_lanes_alive() if (WIN and not run_active()) else None if WIN else {}
                 st.update(phase="offline", offline_since=iso(t - timedelta(seconds=args.interval * (fails - 1))),
                           offline_reason=f"{fails} failed probes in a row",
                           lanes_at_outage=snap if snap is not None else (st.get("lanes_seen") or {}))
