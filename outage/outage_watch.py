@@ -573,19 +573,29 @@ def rebirth_operator(st, ack_wait, actions):
     if alive is None:
         return "operator: could not list processes; nothing opened (operator/operator: see OUTAGE_PLAN.md)"
     ack = p("ack") / (st["outage_id"] + ".operator")
+    try:
+        since = datetime.fromisoformat(str(st.get("offline_since"))).timestamp()
+    except ValueError:
+        since = 0.0
+
+    def acked():  # an ack counts only when written after the outage began (a 01:30 ack proves nothing about 03:00)
+        try:
+            return ack.stat().st_mtime >= since
+        except OSError:
+            return False
     if alive:
         pids = ", ".join(str(a["pid"]) for a in alive)
-        if not ack.exists():
+        if not acked():
             deadline = now() + timedelta(seconds=ack_wait)
             pool_say(f"operator@device4: the internet is back (outage {st['outage_id']}). If you read this, run "
                      f"`python C:/tmp/docket/tools/ops/outage/outage_watch.py ack` NOW. No ack by "
                      f"{deadline:%H:%M} = this session is deaf and ONE new operator terminal opens (OPERATOR_LEASE.txt).",
                      to="operator@device4")
             log(f"operator: interactive Claude alive ({pids}); waiting {ack_wait}s for an ack")
-            while now() < deadline and not ack.exists():
+            while now() < deadline and not acked():
                 touch_lock()
                 time.sleep(min(15, max(1, ack_wait)))
-        if ack.exists():
+        if acked():
             stamp = claim(st["outage_id"], stamp_name, {"result": "acked", "alive": alive})
             return f"operator ACKED ({ack.read_text(encoding='utf-8').strip()[:80]}); no new session"
         alive = claude_sessions() or alive
