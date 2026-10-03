@@ -825,7 +825,7 @@ def supervise(children, pending=(), st=None, standing=False):
     ends without success, it is reborn once (same stamp)."""
     pending = list(pending)
     follow_until = time.time() + 1800
-    last_book_read = 0.0
+    last_book_read = time.monotonic()
     while children or (pending and time.time() < follow_until):
         touch_lock()
         if standing and time.monotonic() - last_book_read >= 60:
@@ -1047,6 +1047,7 @@ def watch(args):
             save_state(st)
             log("no outage began before armed_until: expired")
             if args.standing:
+                time.sleep(60)
                 continue
             return 0
         trig = book_trigger(st)
@@ -1059,6 +1060,7 @@ def watch(args):
             save_state(st)
             do_rebirth(st, args, f"Pool {TRIGGER} from {trig}")
             if args.standing:
+                time.sleep(60)
                 continue
             return 0
         boot = boot_time()
@@ -1096,11 +1098,13 @@ def watch(args):
                 log(f"ONLINE at {st['online_at']} after {oks} good probes")
                 do_rebirth(st, args, "internet back")
                 if args.standing:
+                    time.sleep(60)
                     continue
                 return 0
         elif phase == "online":  # a crash between ONLINE and the rebirth: finish it (stamps keep it once)
             do_rebirth(st, args, "resumed after a watcher restart")
             if args.standing:
+                time.sleep(60)
                 continue
             return 0
         time.sleep(args.interval)
