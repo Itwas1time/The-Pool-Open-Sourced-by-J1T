@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Local outage watcher for trusted personal Pool devices. See outage/README.md."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -232,6 +233,47 @@ def book_trigger(st):
     return found
 
 
+def relaunch_triggers(st):
+    """Read new complete Pool entries. The book supplies only an authorized trigger, never an argv."""
+    book = POOL_DIR / "pool_data" / "pool.txt"
+    try:
+        size = book.stat().st_size
+    except OSError:
+        return [], int(st.get("relaunch_offset") or 0)
+    off = int(st.get("relaunch_offset") or 0)
+    if off > size:  # pruned book
+        off = 0
+    if off == size:
+        return [], off
+    with open(book, "rb") as f:
+        f.seek(off)
+        data = f.read(size - off)
+    data = data[:data.rfind(b"\n") + 1]
+    entries = []
+    entry = []
+    entry_start = off
+    pos = off
+    for raw in data.splitlines(keepends=True) + [b"["]:
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if line.startswith("[") and entry:
+            if len(entry) == 1 and raw == b"[":
+                return entries, entry_start  # a header written before its body; reread it next time
+            head = entry[0]
+            first = entry[1][2:].strip() if len(entry) > 1 and entry[1].startswith("  ") else ""
+            match = re.match(r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\] ([a-z0-9_-]+)@([a-z0-9_.-]+)", head)
+            if (match and first == f"RELAUNCH {MACHINE}"
+                    and (match.group(2), match.group(3)) in (("operator", "device4"), ("claude", "device4"))):
+                identity = hashlib.sha256((head + "\n" + first).encode()).hexdigest()[:16]
+                entries.append((identity, f"{match.group(2)}@{match.group(3)}"))
+            entry = []
+        if line.startswith("[") or entry:
+            if not entry:
+                entry_start = pos
+            entry.append(line)
+        pos += len(raw)
+    return entries, off + len(data)
+
+
 # ---------------------------------------------------------------- the judged-run rule (device4)
 
 RUN_ACTIVE_FILE = Path(os.environ.get("OUTAGE_RUN_ACTIVE") or (DOCKET / "RUN_ACTIVE"))
@@ -417,6 +459,57 @@ def stamp_result(path, **result):
 
 
 # ---------------------------------------------------------------- rebirth actions
+
+RELAUNCH_PROMPT = ("Read ~/outage/RESUME.md, run pool_codex_notify.py --register, "
+                   "and answer operator@device4 on the Pool.")
+
+
+def relaunch_once(line_id, writer):
+    """Claim a Pool line before starting the machine's locally configured fresh session."""
+    stamp = claim("relaunch", line_id, {"writer": writer, "machine": MACHINE})
+    if not stamp:
+        return  # scanner may reread after a crash; the launch must not repeat
+    cfg = read_json(p("relaunch.json"), {})
+    argv = cfg.get("argv")
+    cwd = cfg.get("cwd")
+    if (not isinstance(argv, list) or not argv or not all(isinstance(a, str) and a for a in argv)
+            or not isinstance(cwd, str) or not Path(cwd).is_dir()):
+        result = "FAILED: missing or invalid local relaunch.json argv/cwd"
+    elif run_active():
+        result = "FAILED: judged run active on device4"
+    else:
+        argv = [a.replace("{prompt_shell}", shlex.quote(RELAUNCH_PROMPT))
+                .replace("{prompt}", RELAUNCH_PROMPT) for a in argv]
+        try:
+            if DRY:
+                result = f"WOULD LAUNCH: {subprocess.list2cmdline(argv)} (cwd {cwd})"
+            elif cfg.get("pid_from_stdout"):
+                # tmux -P -F '#{pane_pid}' reports the Codex pane PID, not the short-lived tmux client.
+                proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30,
+                                      creationflags=NOWIN)
+                if proc.returncode:
+                    raise RuntimeError((proc.stderr or proc.stdout).strip()[:200] or f"rc={proc.returncode}")
+                pid = int(proc.stdout.strip())
+                if not pid_alive(pid):
+                    raise RuntimeError(f"launched session pid {pid} is not alive")
+                result = f"done: pid {pid}"
+            else:
+                proc = detached(argv, cwd=cwd)
+                result = f"done: pid {proc.pid}"
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as e:
+            result = f"FAILED: {type(e).__name__}: {e}"
+    stamp_result(stamp, result=result, argv=argv if isinstance(argv, list) else None, cwd=cwd)
+    log(f"RELAUNCH {MACHINE} {result} ({writer})")
+    pool_say(f"RELAUNCH {MACHINE} {result}", to="operator@device4")
+
+
+def process_relaunch(st):
+    entries, offset = relaunch_triggers(st)
+    for line_id, writer in entries:
+        relaunch_once(line_id, writer)
+    st["relaunch_offset"] = offset
+    save_state(st)
+
 
 def detached(argv, cwd=None):
     """Start a process that does not hold the watcher (the watcher supervises it but may exit first)."""
@@ -723,17 +816,21 @@ def do_rebirth(st, args, reason):
     st["phase"] = "done"
     st["rebirth_at"] = iso()
     save_state(st)
-    supervise(children, pending, st)
+    supervise(children, pending, st, standing=args.standing)
 
 
-def supervise(children, pending=(), st=None):
+def supervise(children, pending=(), st=None, standing=False):
     """Stay alive while reborn lanes run, and tell the operator when each ends (its own task notification died
     with the old session). A lane whose launcher was still retrying at ONLINE is followed for 30 min: if it then
     ends without success, it is reborn once (same stamp)."""
     pending = list(pending)
     follow_until = time.time() + 1800
+    last_book_read = 0.0
     while children or (pending and time.time() < follow_until):
         touch_lock()
+        if standing and time.monotonic() - last_book_read >= 60:
+            process_relaunch(load_state())
+            last_book_read = time.monotonic()
         if pending and not run_active():
             alive = sol_lanes_alive()
             for e in list(pending):
@@ -814,6 +911,7 @@ def cmd_arm(args):
     book = POOL_DIR / "pool_data" / "pool.txt"
     st = {"phase": "armed", "outage_id": oid, "armed_at": iso(), "armed_from": iso(frm), "armed_until": iso(until),
           "boot_at_arm": boot_time(), "book_offset": book.stat().st_size if book.exists() else 0,
+          "relaunch_offset": book.stat().st_size if book.exists() else 0,
           "resume_path": str(Path(args.resume)) if args.resume else str(p("resume.json")), "machine": MACHINE}
     save_state(st)
     log(f"ARMED {oid}: watching from {st['armed_from']} until {st['armed_until']} (if no outage begins by then)")
@@ -917,9 +1015,13 @@ def cmd_run(args):
 
 def watch(args):
     st = load_state()
-    if st.get("phase") not in ("armed", "offline", "online"):
+    if st.get("phase") not in ("armed", "offline", "online") and not args.standing:
         log(f"not armed (phase {st.get('phase')}); nothing to watch")
         return 0
+    if "relaunch_offset" not in st:
+        book = POOL_DIR / "pool_data" / "pool.txt"
+        st["relaunch_offset"] = book.stat().st_size if book.exists() else 0
+        save_state(st)
     log(f"watcher up (pid {os.getpid()}, phase {st['phase']}, outage {st.get('outage_id')})")
     fails = oks = 0
     last_snap = 0.0
@@ -927,7 +1029,13 @@ def watch(args):
         touch_lock()
         st = load_state()
         phase = st.get("phase")
+        process_relaunch(st)
         if phase not in ("armed", "offline", "online"):
+            if args.standing:
+                # The relaunch scan reads each new entry, including inert REBIRTH lines, once per minute.
+                # Outside the armed outage window there are no network probes.
+                time.sleep(60)
+                continue
             log(f"phase {phase}: watcher exits")
             return 0
         t = now()
@@ -938,6 +1046,8 @@ def watch(args):
             st["phase"] = "expired"
             save_state(st)
             log("no outage began before armed_until: expired")
+            if args.standing:
+                continue
             return 0
         trig = book_trigger(st)
         save_state(st)
@@ -948,6 +1058,8 @@ def watch(args):
             st["phase"] = "online"
             save_state(st)
             do_rebirth(st, args, f"Pool {TRIGGER} from {trig}")
+            if args.standing:
+                continue
             return 0
         boot = boot_time()
         if (phase == "armed" and st.get("boot_at_arm") and boot - float(st["boot_at_arm"]) > 120
@@ -983,9 +1095,13 @@ def watch(args):
                 save_state(st)
                 log(f"ONLINE at {st['online_at']} after {oks} good probes")
                 do_rebirth(st, args, "internet back")
+                if args.standing:
+                    continue
                 return 0
         elif phase == "online":  # a crash between ONLINE and the rebirth: finish it (stamps keep it once)
             do_rebirth(st, args, "resumed after a watcher restart")
+            if args.standing:
+                continue
             return 0
         time.sleep(args.interval)
 
@@ -1010,6 +1126,7 @@ def main(argv):
         r = sub.add_parser(name)
         r.add_argument("--probe-file", default=None)
         r.add_argument("--interval", type=float, default=60)
+        r.add_argument("--standing", action="store_true", help="keep reading Pool triggers after the outage window")
         r.add_argument("--offline-after", type=int, default=3)
         r.add_argument("--online-after", type=int, default=3)
         r.add_argument("--ack-wait", type=float, default=900)
