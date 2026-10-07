@@ -50,6 +50,10 @@ members connected. The history remains sensitive, so keep this repo private.
 5. To preserve current users' Git history, prefer a **new, clean public repository**
    containing the sanitized source snapshot, while keeping this existing private
    repository private. Current members can continue using their original remote.
+   If the old key has never been exposed and is absent from the new repository,
+   publishing that separate snapshot does not itself require rotating the private
+   Pool's key or changing its users' configuration. Rotation is still needed if
+   exposure is suspected.
    If this exact repository must become public, history cleanup requires an
    explicitly coordinated migration for every checkout and branch.
 6. Verify firewall scope on every device and confirm that no router forwarding,
