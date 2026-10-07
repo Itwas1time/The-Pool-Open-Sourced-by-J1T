@@ -74,6 +74,8 @@ def load_config():
                                       "udp_port": 50506, "names": {}}, indent=2), encoding="utf-8")
         print(f"Created {CONFIG} - copy this same file to every machine in the pool.")
     cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+    if not isinstance(cfg.get("pool_key"), str) or not cfg["pool_key"].strip():
+        raise SystemExit("Set a nonempty shared pool_key in private local configuration.")
     KEY = cfg["pool_key"].encode()
     TCP_PORT = int(cfg.get("tcp_port", 50505))
     UDP_PORT = int(cfg.get("udp_port", 50506))
