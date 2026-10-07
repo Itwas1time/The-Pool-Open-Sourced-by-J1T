@@ -2,15 +2,9 @@ pool_data/
 runtime/
 __pycache__/
 *.pyc
-
-pool_config.json
-
 pool_config.local.json
-
+pool_config.json
 .env
-
 .env.*
-
 *.pem
-
 *.key

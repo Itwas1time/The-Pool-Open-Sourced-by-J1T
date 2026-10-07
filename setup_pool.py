@@ -42,7 +42,8 @@ def copy_runtime():
 
 
 def add_firewall_rules():
-    cfg = json.loads((HERE / "pool_config.json").read_text(encoding="utf-8"))
+    from pool import config_path
+    cfg = json.loads(config_path().read_text(encoding="utf-8"))
     tcp, udp = int(cfg.get("tcp_port", 50505)), int(cfg.get("udp_port", 50506))
     public = ",".join(f"'{r}'" for r in PUBLIC_INTERNET)
     lines = ["$ErrorActionPreference = 'Stop'",
@@ -52,9 +53,11 @@ def add_firewall_rules():
         common = f"-Group 'The Pool' -Program '{prog}' -Profile Any"
         lines += [
             f"New-NetFirewallRule -DisplayName 'The Pool - {exe} TCP in' {common} -Direction Inbound -Action Allow "
-            f"-Protocol TCP -LocalPort {tcp} -RemoteAddress LocalSubnet | Out-Null",
+            f"-Protocol TCP -LocalPort {tcp} -RemoteAddress LocalSubnet -InterfaceType Wired "
+            f"-EdgeTraversalPolicy Block | Out-Null",
             f"New-NetFirewallRule -DisplayName 'The Pool - {exe} UDP in' {common} -Direction Inbound -Action Allow "
-            f"-Protocol UDP -LocalPort {udp} -RemoteAddress LocalSubnet | Out-Null",
+            f"-Protocol UDP -LocalPort {udp} -RemoteAddress LocalSubnet -InterfaceType Wired "
+            f"-EdgeTraversalPolicy Block | Out-Null",
             f"New-NetFirewallRule -DisplayName 'The Pool - {exe} no internet' {common} -Direction Outbound "
             f"-Action Block -RemoteAddress @({public}) | Out-Null",
         ]

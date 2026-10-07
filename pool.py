@@ -5,7 +5,7 @@ on every other machine. Each machine keeps the whole conversation in one plain t
 file, pool_data/pool.txt, for about two months. People and agents (Claude, Codex)
 use it the same way.
 
-  pool.bat say "text" [--to codex@minas]   write in the book (every online machine gets it)
+  pool.bat say "text" [--to codex@node-a]  write in the book (every online machine gets it)
   pool.bat read                            what is new since I last read
   pool.bat wait [--timeout SECONDS]        block until someone writes, then show it
   pool.bat book [N]                        the last N entries (default 20)
@@ -39,6 +39,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "pool_config.json"
+LOCAL_CONFIG = HERE / "pool_config.local.json"
 DATA = HERE / "pool_data"
 BOOK = DATA / "pool.txt"
 ASSETS = HERE / "assets"
@@ -51,6 +52,8 @@ KEEP_DAYS = 60             # the book keeps about two months
 ANNOUNCE_EVERY = 30        # seconds between "I'm here" broadcasts
 ONLINE_WINDOW = 90         # a machine counts as online if heard from this recently
 MAX_MESSAGE = 20_000_000   # bytes on the wire, about 15 MB of file
+MAX_CONNECTIONS = 8       # bound untrusted connections and their read buffers
+MAX_NOTIFICATIONS = 4     # bound one-shot local notification processes
 STATUS_LIMIT = 500         # characters of my_status.txt shared with the others
 
 KEY = b""
@@ -64,16 +67,51 @@ lock = threading.Lock()
 book_lock = threading.Lock()
 alive = threading.Event()  # set while this process is the machine's Pool
 sockets = []
+connection_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+notification_slots = threading.BoundedSemaphore(MAX_NOTIFICATIONS)
 node_mode, started_at = "", ""
+
+
+def config_path():
+    """Prefer private local configuration; keep existing installations compatible."""
+    override = os.environ.get("POOL_CONFIG_PATH")
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_file():
+            raise SystemExit("POOL_CONFIG_PATH must name an existing private configuration file.")
+        return path
+    return LOCAL_CONFIG if LOCAL_CONFIG.exists() or not CONFIG.exists() else CONFIG
+
+
+def create_private_config(path, value):
+    """Create, never replace, a private configuration (owner-only on POSIX)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as output:
+        json.dump(value, output, indent=2)
+        output.write("\n")
+
+
+def migrate_config():
+    """Keep the same key and names in an ignored file; no restart or peer changes."""
+    value = json.loads(config_path().read_text(encoding="utf-8"))
+    if LOCAL_CONFIG.exists():
+        if json.loads(LOCAL_CONFIG.read_text(encoding="utf-8")) != value:
+            raise SystemExit("Existing private configuration preserved; review it manually.")
+    else:
+        create_private_config(LOCAL_CONFIG, value)
+    return f"Private configuration ready: {LOCAL_CONFIG}. Key and names are unchanged."
 
 
 def load_config():
     global KEY, TCP_PORT, UDP_PORT, NAMES, NAME
-    if not CONFIG.exists():
-        CONFIG.write_text(json.dumps({"pool_key": secrets.token_hex(16), "tcp_port": 50505,
-                                      "udp_port": 50506, "names": {}}, indent=2), encoding="utf-8")
-        print(f"Created {CONFIG} - copy this same file to every machine in the pool.")
-    cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
+    path = config_path()
+    if not path.exists():
+        create_private_config(path, {"pool_key": secrets.token_hex(32), "tcp_port": 50505,
+                                     "udp_port": 50506, "names": {}})
+        print(f"Created {path} - securely copy this same file to every machine in the pool.")
+    cfg = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(cfg.get("pool_key"), str) or not cfg["pool_key"].strip():
+        raise SystemExit("Set a nonempty shared pool_key in the private configuration.")
     KEY = cfg["pool_key"].encode()
     TCP_PORT = int(cfg.get("tcp_port", 50505))
     UDP_PORT = int(cfg.get("udp_port", 50506))
@@ -91,13 +129,15 @@ def pack(body):
 
 def unpack(data):
     """Return the message dict, or None if it was not signed with our pool key."""
+    if not KEY or len(data) > MAX_MESSAGE:
+        return None
     sig, _, raw = data.decode("utf-8", "replace").strip().partition(" ")
     good = hmac.new(KEY, raw.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(sig.encode(), good.encode()):
         return None
     try:
         msg = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return msg if isinstance(msg, dict) else None
 
@@ -198,6 +238,9 @@ def lower_priority():
 # ---- the book: one plain text file, an entry is "[time] who@machine -> to" then indented lines ----
 
 def write_in_book(stamp, who, machine, to, text):
+    # A peer cannot inject a second entry through a newline in a header field.
+    stamp, who, machine, to = (" ".join(str(value).splitlines())
+                              for value in (stamp, who, machine, to))
     head = f"[{stamp}] {addr(who, machine)}" + (f" -> {to}" if to else "")
     body = "\n".join("  " + line for line in (str(text).splitlines() or [""]))
     DATA.mkdir(parents=True, exist_ok=True)
@@ -363,6 +406,15 @@ def wired_source_for(ip):
     return next((str(w.ip) for w in list(wired) if address in w.network), None)
 
 
+def wired_connection(local_ip, remote_ip):
+    """Both endpoints must belong to the same connected wired subnet."""
+    try:
+        remote = ipaddress.IPv4Address(remote_ip)
+    except (ValueError, TypeError):
+        return False
+    return any(str(w.ip) == local_ip and remote in w.network for w in list(wired))
+
+
 def announce(only_to=None):
     """Broadcast "I'm here" out of every wired port (or answer one machine directly)."""
     data = pack({"kind": "hello", "from": NAME, "port": TCP_PORT, "ram": ram_percent(), "status": my_status()})
@@ -413,6 +465,8 @@ def listen_udp(sock):
         try:
             port = int(msg.get("port") or TCP_PORT)
         except (TypeError, ValueError):
+            continue
+        if not 1 <= port <= 65535:
             continue
         with lock:
             old = peers.get(name)
@@ -469,13 +523,22 @@ def notify_here(to, message):
                 log(f"notify command failed: {(r.stderr or r.stdout).strip()[:200]}")
         except (OSError, subprocess.SubprocessError) as e:
             log(f"notify command failed: {e}")
-    threading.Thread(target=run, daemon=True).start()
+        finally:
+            notification_slots.release()
+    if not notification_slots.acquire(blocking=False):
+        log("notify capacity reached; entry remains in the book for read/wait")
+        return
+    try:
+        threading.Thread(target=run, daemon=True).start()
+    except Exception:
+        notification_slots.release()
+        raise
 
 
 def handle(conn, ip):
     with conn, conn.makefile("rb") as f:
         try:
-            if conn.getsockname()[0] not in {str(w.ip) for w in list(wired)}:
+            if not wired_connection(conn.getsockname()[0], ip):
                 log(f"ignored a connection from {ip}: it did not come in on a wired port")
                 return
             conn.settimeout(30)
@@ -490,12 +553,18 @@ def handle(conn, ip):
         except Exception as e:
             log(f"error receiving from {ip}: {e}")
             try:
-                conn.sendall(f"ERR {e}\n".encode())
+                conn.sendall(b"ERR could not receive message\n")
             except OSError:
                 pass
 
 
 def serve_tcp(server):
+    def bounded_handle(conn, ip):
+        try:
+            handle(conn, ip)
+        finally:
+            connection_slots.release()
+
     while True:
         try:
             conn, (ip, _) = server.accept()
@@ -504,13 +573,21 @@ def serve_tcp(server):
                 return  # closed by finish_node()
             time.sleep(1)
             continue
-        threading.Thread(target=handle, args=(conn, ip), daemon=True).start()
+        if not wired_connection(conn.getsockname()[0], ip) or not connection_slots.acquire(blocking=False):
+            conn.close()
+            continue
+        try:
+            threading.Thread(target=bounded_handle, args=(conn, ip), daemon=True).start()
+        except Exception:
+            connection_slots.release()
+            conn.close()
+            raise
 
 
 # ---- writing: into my book and every online machine's book ----
 
 def mention(to):
-    """Tidy a --to mention: 'codex@minas' -> 'codex@device1'."""
+    """Resolve a unique machine prefix in a --to mention."""
     who, _, machine = str(to or "").strip().lower().rpartition("@")
     if machine in ("", "all", "everyone", "pool"):
         return ""  # the whole pool
@@ -790,7 +867,7 @@ def mcp_tools():
                 "inputSchema": {"type": "object", "properties": props, "required": required}}
     return [
         tool("say", "Write in the Pool's book. Without 'to' it is a pool message: every machine online gets it. "
-             "With 'to' (agent@machine like codex@device1, or just a machine) it is a direct message: only "
+             "With 'to' (agent@machine like codex@node-a, or just a machine) it is a direct message: only "
              "that machine gets it.", {"text": s, "to": s}, ["text"]),
         tool("read", "What was written in the book since you last read.", {}, []),
         tool("wait", "Block until someone writes something new (up to timeout_seconds, default 50, max 110), "
@@ -845,7 +922,7 @@ def mcp_serve(who):
     out.reconfigure(encoding="utf-8")
     write_lock = threading.Lock()
     me = addr(agent_name(who) or "anyone", NAME)
-    guide = (f"The Pool is a shared book between operator's machines (wired). You are {me}. say without 'to' is a "
+    guide = (f"The Pool is a shared book between trusted local devices (wired). You are {me}. say without 'to' is a "
              "pool message (every machine gets it); say with 'to' (agent@machine or a machine) is a direct "
              "message (only that machine gets it). read shows what is new; wait blocks until something for you "
              "is written. Code goes through GitHub: name the commit, never paste code. Never put secrets in the book.")
@@ -1127,10 +1204,14 @@ def main(argv):
     command("wait").add_argument("--timeout", type=float, default=600)
     command("book").add_argument("n", nargs="?", type=int, default=20)
     command("sendfile", "path").add_argument("--to", default="")
-    for name in ("peers", "start", "stop", "status", "serve", "mcp"):
+    for name in ("peers", "start", "stop", "status", "serve", "mcp", "migrate-config"):
         command(name)
     args = ap.parse_args(argv)
     who = args.who
+
+    if args.cmd == "migrate-config":
+        print(migrate_config())
+        return 0
 
     if args.cmd == "serve":
         serve_forever()
